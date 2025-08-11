@@ -1,0 +1,536 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
+from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import xgboost as xgb
+from scipy import stats
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# 1. CHARGEMENT ET PRÉPARATION DES DONNÉES
+# ==========================================
+
+def load_and_prepare_data(file_path):
+    """
+    Charge et prépare les données de la cantine
+    """
+    # Chargement des données
+    df = pd.read_csv(file_path)
+    
+    # Conversion de la date en datetime
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Tri par date
+    df = df.sort_values('date').reset_index(drop=True)
+    
+    # Gestion des valeurs manquantes
+    df = df.fillna(method='ffill').fillna(0)
+    
+    return df
+
+# ==========================================
+# 2. FEATURE ENGINEERING
+# ==========================================
+
+def create_features(df):
+    """
+    Création de nouvelles features pour améliorer les prédictions
+    """
+    df = df.copy()
+    
+    # 1. Ratio entrées cantine / entrées entreprise
+    df['ratio_cantine'] = df['nb_entrees_cantine'] / df['bn_entrees_HO'].replace(0, 1)
+    
+    # 2. Moyennes mobiles (7 jours, 14 jours, 30 jours)
+    df['ma_7_cantine'] = df['nb_entrees_cantine'].rolling(window=7, min_periods=1).mean()
+    df['ma_14_cantine'] = df['nb_entrees_cantine'].rolling(window=14, min_periods=1).mean()
+    df['ma_30_cantine'] = df['nb_entrees_cantine'].rolling(window=30, min_periods=1).mean()
+    
+    # 3. Moyennes mobiles du ratio
+    df['ma_7_ratio'] = df['ratio_cantine'].rolling(window=7, min_periods=1).mean()
+    df['ma_14_ratio'] = df['ratio_cantine'].rolling(window=14, min_periods=1).mean()
+    
+    # 4. Écart-type mobile (volatilité)
+    df['std_7_cantine'] = df['nb_entrees_cantine'].rolling(window=7, min_periods=1).std()
+    df['std_14_cantine'] = df['nb_entrees_cantine'].rolling(window=14, min_periods=1).std()
+    
+    # 5. Valeurs décalées (lag features)
+    for lag in [1, 7, 14]:
+        df[f'lag_{lag}_cantine'] = df['nb_entrees_cantine'].shift(lag)
+        df[f'lag_{lag}_ratio'] = df['ratio_cantine'].shift(lag)
+    
+    # 6. Indicateurs de jours spéciaux
+    df['jour_special'] = ((df['conge_scolaires'] == 1) | 
+                         (df['jeunes'] > 0) | 
+                         (df['BEM'] == 1) | 
+                         (df['BAC'] == 1)).astype(int)
+    
+    # 7. Indicateurs météo combinés
+    df['mauvais_temps'] = ((df['pluie'] == 1) | 
+                           (df['fortement_nuageux'] == 1)).astype(int)
+    
+    # 8. Encodage cyclique pour le jour du mois
+    df['jour_sin'] = np.sin(2 * np.pi * df['jour'] / 31)
+    df['jour_cos'] = np.cos(2 * np.pi * df['jour'] / 31)
+    
+    # 9. Encodage cyclique pour le mois
+    df['mois_sin'] = np.sin(2 * np.pi * df['mois'] / 12)
+    df['mois_cos'] = np.cos(2 * np.pi * df['mois'] / 12)
+    
+    # 10. Weekend indicator
+    df['weekend'] = (df['jour_num'].isin([1, 7])).astype(int)
+    
+    # Suppression des premières lignes avec NaN dus aux features décalées
+    df = df.dropna()
+    
+    return df
+
+# ==========================================
+# 3. ENCODAGE DES VARIABLES CATÉGORIELLES
+# ==========================================
+
+def encode_categorical(df):
+    """
+    Encode les variables catégorielles
+    """
+    df = df.copy()
+    
+    # Encodage du mois hijri
+    if 'hijri_month' in df.columns:
+        le = LabelEncoder()
+        df['hijri_month_encoded'] = le.fit_transform(df['hijri_month'].astype(str))
+    
+    return df
+
+# ==========================================
+# 4. SÉLECTION DES FEATURES
+# ==========================================
+
+def select_features(df):
+    """
+    Sélectionne les features pour le modèle
+    """
+    feature_cols = [
+        # Features temporelles
+        'jour_num', 'jour_sin', 'jour_cos', 'mois_sin', 'mois_cos', 'weekend',
+        
+        # Features spéciales
+        'conge_scolaires', 'jeunes', 'BEM', 'BAC', 'jour_special',
+        
+        # Features météo
+        'temperature', 'vitesse_du_vent', 'clair', 'nuageux', 
+        'fortement_nuageux', 'pluie', 'mauvais_temps',
+        
+        # Features historiques
+        'ma_7_cantine', 'ma_14_cantine', 'ma_30_cantine',
+        'ma_7_ratio', 'ma_14_ratio',
+        'std_7_cantine', 'std_14_cantine',
+        'lag_1_cantine', 'lag_7_cantine', 'lag_14_cantine',
+        'lag_1_ratio', 'lag_7_ratio', 'lag_14_ratio',
+        
+        # Ratio actuel
+        'ratio_cantine',
+        
+        # Entrées entreprise
+        'bn_entrees_HO'
+    ]
+    
+    # Vérifier quelles features existent dans le dataframe
+    available_features = [col for col in feature_cols if col in df.columns]
+    
+    return available_features
+
+# ==========================================
+# 5. MODÈLES DE PRÉDICTION
+# ==========================================
+
+class CantineOptimizer:
+    def __init__(self, cost_shortage=10, cost_surplus=2):
+        """
+        Initialise l'optimiseur de cantine
+        
+        Parameters:
+        -----------
+        cost_shortage : float
+            Coût unitaire d'une pénurie (manque de plat)
+        cost_surplus : float
+            Coût unitaire d'un surplus (plat non consommé)
+        """
+        self.cost_shortage = cost_shortage
+        self.cost_surplus = cost_surplus
+        self.models = {}
+        self.best_model = None
+        self.feature_cols = None
+        
+    def train_models(self, X_train, y_train):
+        """
+        Entraîne plusieurs modèles et sélectionne le meilleur
+        """
+        # Random Forest
+        rf = RandomForestRegressor(
+            n_estimators=100,
+            max_depth=10,
+            min_samples_split=5,
+            random_state=42
+        )
+        
+        # Gradient Boosting
+        gb = GradientBoostingRegressor(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=5,
+            random_state=42
+        )
+        
+        # XGBoost
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=5,
+            random_state=42
+        )
+        
+        # Entraînement des modèles
+        models = {
+            'RandomForest': rf,
+            'GradientBoosting': gb,
+            'XGBoost': xgb_model
+        }
+        
+        # Validation croisée temporelle
+        tscv = TimeSeriesSplit(n_splits=3)
+        
+        best_score = float('inf')
+        
+        for name, model in models.items():
+            scores = []
+            for train_idx, val_idx in tscv.split(X_train):
+                X_t, X_v = X_train.iloc[train_idx], X_train.iloc[val_idx]
+                y_t, y_v = y_train.iloc[train_idx], y_train.iloc[val_idx]
+                
+                model.fit(X_t, y_t)
+                pred = model.predict(X_v)
+                score = mean_absolute_error(y_v, pred)
+                scores.append(score)
+            
+            avg_score = np.mean(scores)
+            self.models[name] = model
+            
+            print(f"{name} - MAE moyen: {avg_score:.2f}")
+            
+            if avg_score < best_score:
+                best_score = avg_score
+                self.best_model = name
+        
+        # Réentraînement du meilleur modèle sur toutes les données
+        best_model = self.models[self.best_model]
+        best_model.fit(X_train, y_train)
+        self.models[self.best_model] = best_model
+        
+        print(f"\nMeilleur modèle: {self.best_model}")
+        
+        return self
+    
+    def predict_with_uncertainty(self, X):
+        """
+        Fait une prédiction avec estimation de l'incertitude
+        """
+        model = self.models[self.best_model]
+        
+        if self.best_model == 'RandomForest':
+            # Pour Random Forest, on peut obtenir les prédictions de chaque arbre
+            predictions = []
+            for tree in model.estimators_:
+                pred = tree.predict(X)
+                predictions.append(pred)
+            
+            predictions = np.array(predictions)
+            mean_pred = np.mean(predictions, axis=0)
+            std_pred = np.std(predictions, axis=0)
+        else:
+            # Pour les autres modèles, on utilise la prédiction simple
+            mean_pred = model.predict(X)
+            # Estimation approximative de l'incertitude basée sur l'erreur historique
+            std_pred = np.ones_like(mean_pred) * 20  # À ajuster selon les données
+        
+        return mean_pred, std_pred
+    
+    def optimize_order_quantity(self, predicted_demand, uncertainty, confidence_level=0.85):
+        """
+        Calcule la quantité optimale à commander en fonction de la demande prédite
+        et de l'incertitude, en tenant compte des coûts
+        """
+        # Calcul du quantile optimal basé sur le ratio des coûts
+        # Formule de newsvendor
+        critical_ratio = self.cost_shortage / (self.cost_shortage + self.cost_surplus)
+        
+        # Ajustement basé sur le niveau de confiance
+        z_score = stats.norm.ppf(confidence_level)
+        
+        # Quantité optimale = prédiction + marge de sécurité
+        optimal_quantity = predicted_demand + z_score * uncertainty
+        
+        # Arrondi à l'entier supérieur
+        optimal_quantity = np.ceil(optimal_quantity)
+        
+        return optimal_quantity
+    
+    def calculate_costs(self, actual, ordered):
+        """
+        Calcule les coûts totaux (pénurie + surplus)
+        """
+        shortage = max(0, actual - ordered)
+        surplus = max(0, ordered - actual)
+        
+        total_cost = shortage * self.cost_shortage + surplus * self.cost_surplus
+        
+        return {
+            'shortage': shortage,
+            'surplus': surplus,
+            'cost_shortage': shortage * self.cost_shortage,
+            'cost_surplus': surplus * self.cost_surplus,
+            'total_cost': total_cost
+        }
+
+# ==========================================
+# 6. FONCTION PRINCIPALE D'OPTIMISATION
+# ==========================================
+
+def optimize_cantine(df, test_size=30, cost_shortage=10, cost_surplus=2):
+    """
+    Fonction principale pour optimiser les commandes de la cantine
+    """
+    print("="*60)
+    print("OPTIMISATION DE LA CANTINE")
+    print("="*60)
+    
+    # 1. Feature engineering
+    print("\n1. Création des features...")
+    df_features = create_features(df)
+    df_features = encode_categorical(df_features)
+    
+    # 2. Sélection des features
+    print("\n2. Sélection des features...")
+    feature_cols = select_features(df_features)
+    
+    # 3. Division train/test
+    print(f"\n3. Division des données (test sur {test_size} derniers jours)...")
+    train_df = df_features[:-test_size]
+    test_df = df_features[-test_size:]
+    
+    X_train = train_df[feature_cols]
+    y_train = train_df['nb_entrees_cantine']
+    X_test = test_df[feature_cols]
+    y_test = test_df['nb_entrees_cantine']
+    
+    # 4. Entraînement des modèles
+    print("\n4. Entraînement des modèles...")
+    optimizer = CantineOptimizer(cost_shortage=cost_shortage, cost_surplus=cost_surplus)
+    optimizer.train_models(X_train, y_train)
+    
+    # 5. Prédictions et optimisation
+    print("\n5. Prédictions et optimisation...")
+    predictions, uncertainties = optimizer.predict_with_uncertainty(X_test)
+    
+    # Calcul des quantités optimales
+    optimal_orders = []
+    for pred, unc in zip(predictions, uncertainties):
+        opt_qty = optimizer.optimize_order_quantity(pred, unc)
+        optimal_orders.append(opt_qty)
+    
+    optimal_orders = np.array(optimal_orders)
+    
+    # 6. Évaluation des résultats
+    print("\n6. Évaluation des résultats...")
+    print("-"*40)
+    
+    # Comparaison avec la stratégie fixe (400 plats)
+    fixed_orders = np.ones_like(y_test) * 400
+    
+    # Calcul des coûts pour chaque stratégie
+    costs_fixed = []
+    costs_optimal = []
+    
+    for actual, fixed, optimal in zip(y_test, fixed_orders, optimal_orders):
+        cost_f = optimizer.calculate_costs(actual, fixed)
+        cost_o = optimizer.calculate_costs(actual, optimal)
+        costs_fixed.append(cost_f['total_cost'])
+        costs_optimal.append(cost_o['total_cost'])
+    
+    # Statistiques
+    print(f"\nStratégie FIXE (400 plats):")
+    print(f"  - Coût total: {sum(costs_fixed):.0f} €")
+    print(f"  - Coût moyen/jour: {np.mean(costs_fixed):.2f} €")
+    print(f"  - Taux de pénurie: {np.mean([1 if a > 400 else 0 for a in y_test])*100:.1f}%")
+    print(f"  - Taux de surplus: {np.mean([1 if a < 400 else 0 for a in y_test])*100:.1f}%")
+    
+    print(f"\nStratégie OPTIMISÉE:")
+    print(f"  - Coût total: {sum(costs_optimal):.0f} €")
+    print(f"  - Coût moyen/jour: {np.mean(costs_optimal):.2f} €")
+    print(f"  - Commande moyenne: {np.mean(optimal_orders):.0f} plats")
+    print(f"  - Écart-type commandes: {np.std(optimal_orders):.0f}")
+    
+    print(f"\nÉCONOMIES RÉALISÉES:")
+    savings = sum(costs_fixed) - sum(costs_optimal)
+    savings_pct = (savings / sum(costs_fixed)) * 100
+    print(f"  - Total: {savings:.0f} €")
+    print(f"  - Pourcentage: {savings_pct:.1f}%")
+    
+    # 7. Analyse détaillée
+    print("\n7. Analyse détaillée des prédictions...")
+    mae = mean_absolute_error(y_test, predictions)
+    rmse = np.sqrt(mean_squared_error(y_test, predictions))
+    print(f"  - MAE: {mae:.2f}")
+    print(f"  - RMSE: {rmse:.2f}")
+    
+    # 8. Importance des features
+    if optimizer.best_model == 'RandomForest':
+        print("\n8. Features les plus importantes:")
+        model = optimizer.models[optimizer.best_model]
+        importances = model.feature_importances_
+        feature_importance = pd.DataFrame({
+            'feature': feature_cols,
+            'importance': importances
+        }).sort_values('importance', ascending=False)
+        
+        for i, row in feature_importance.head(10).iterrows():
+            print(f"  - {row['feature']}: {row['importance']:.4f}")
+    
+    # Retour des résultats
+    results = {
+        'test_dates': test_df['date'].values,
+        'actual_demand': y_test.values,
+        'predictions': predictions,
+        'optimal_orders': optimal_orders,
+        'fixed_orders': fixed_orders,
+        'costs_optimal': costs_optimal,
+        'costs_fixed': costs_fixed,
+        'savings': savings,
+        'savings_pct': savings_pct,
+        'optimizer': optimizer
+    }
+    
+    return results
+
+# ==========================================
+# 7. FONCTION DE RECOMMANDATION QUOTIDIENNE
+# ==========================================
+
+def get_daily_recommendation(optimizer, current_data, feature_cols):
+    """
+    Génère une recommandation pour un jour donné
+    """
+    # Préparation des données
+    X = current_data[feature_cols]
+    
+    # Prédiction avec incertitude
+    pred, unc = optimizer.predict_with_uncertainty(X)
+    
+    # Calcul de la quantité optimale
+    optimal_qty = optimizer.optimize_order_quantity(pred[0], unc[0])
+    
+    # Recommandation
+    recommendation = {
+        'predicted_demand': int(pred[0]),
+        'uncertainty': int(unc[0]),
+        'recommended_order': int(optimal_qty),
+        'confidence_interval': (
+            int(max(0, pred[0] - 2*unc[0])),
+            int(pred[0] + 2*unc[0])
+        )
+    }
+    
+    return recommendation
+
+# ==========================================
+# 8. SCRIPT PRINCIPAL D'EXÉCUTION
+# ==========================================
+
+if __name__ == "__main__":
+    # Charger les données (remplacer par le chemin réel)
+    # df = load_and_prepare_data('cantine_data.csv')
+    
+    # Pour la démonstration, créons un dataset exemple
+    np.random.seed(42)
+    n_days = 365
+    
+    # Génération de données synthétiques pour la démonstration
+    dates = pd.date_range(start='2023-01-01', periods=n_days)
+    
+    df_demo = pd.DataFrame({
+        'date': dates,
+        'jour': dates.day,
+        'mois': dates.month,
+        'annee': dates.year,
+        'jour_num': dates.dayofweek + 1,
+        'hijri_day': np.random.randint(1, 31, n_days),
+        'hijri_month': np.random.choice(['Mouharram', 'Safar', 'Rabi1', 'Rabi2'], n_days),
+        'conge_scolaires': np.random.binomial(1, 0.1, n_days),
+        'jeunes': np.random.choice([0, 1, 2], n_days, p=[0.7, 0.2, 0.1]),
+        'temperature': np.random.normal(25, 5, n_days),
+        'vitesse_du_vent': np.random.exponential(10, n_days),
+        'clair': np.random.binomial(1, 0.4, n_days),
+        'nuageux': np.random.binomial(1, 0.3, n_days),
+        'fortement_nuageux': np.random.binomial(1, 0.2, n_days),
+        'pluie': np.random.binomial(1, 0.1, n_days),
+        'BEM': np.random.binomial(1, 0.05, n_days),
+        'BAC': np.random.binomial(1, 0.05, n_days),
+        'bn_entrees_HO': np.random.normal(500, 50, n_days),
+        'nb_entrees_cantine': np.random.normal(380, 60, n_days)
+    })
+    
+    # Ajustement pour rendre les données plus réalistes
+    # Moins de personnes à la cantine les weekends
+    weekend_mask = df_demo['jour_num'].isin([1, 7])
+    df_demo.loc[weekend_mask, 'nb_entrees_cantine'] *= 0.7
+    
+    # Moins de personnes pendant les congés
+    conge_mask = df_demo['conge_scolaires'] == 1
+    df_demo.loc[conge_mask, 'nb_entrees_cantine'] *= 0.8
+    
+    # Moins de personnes pendant les jours de jeûne
+    jeune_mask = df_demo['jeunes'] > 0
+    df_demo.loc[jeune_mask, 'nb_entrees_cantine'] *= 0.75
+    
+    # S'assurer que les valeurs sont positives et entières
+    df_demo['bn_entrees_HO'] = np.maximum(100, df_demo['bn_entrees_HO']).astype(int)
+    df_demo['nb_entrees_cantine'] = np.maximum(50, df_demo['nb_entrees_cantine']).astype(int)
+    
+    # Lancer l'optimisation
+    print("\n" + "="*60)
+    print("DÉMONSTRATION SUR DONNÉES SYNTHÉTIQUES")
+    print("="*60)
+    
+    results = optimize_cantine(
+        df_demo, 
+        test_size=30,
+        cost_shortage=10,  # Coût élevé pour les pénuries
+        cost_surplus=2      # Coût faible pour les surplus
+    )
+    
+    # Exemple de recommandation pour demain
+    print("\n" + "="*60)
+    print("RECOMMANDATION POUR DEMAIN")
+    print("="*60)
+    
+    # Simuler les données de demain (dernière ligne avec modifications)
+    tomorrow_data = create_features(df_demo).tail(1).copy()
+    feature_cols = select_features(tomorrow_data)
+    
+    recommendation = get_daily_recommendation(
+        results['optimizer'], 
+        tomorrow_data, 
+        feature_cols
+    )
+    
+    print(f"\nDemande prédite: {recommendation['predicted_demand']} personnes")
+    print(f"Incertitude: ±{recommendation['uncertainty']} personnes")
+    print(f"Intervalle de confiance 95%: {recommendation['confidence_interval']}")
+    print(f"\n🎯 COMMANDE RECOMMANDÉE: {recommendation['recommended_order']} plats")
+    
+    print("\n" + "="*60)
+    print("FIN DE L'ANALYSE")
+    print("="*60)
