@@ -1,0 +1,86 @@
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.neighbors import NearestNeighbors
+import numpy as np
+import re
+from collections import defaultdict
+
+# Charger le dataset
+df = pd.read_csv('votre_dataset.csv')  # Remplacez par votre fichier
+column_name = 'nom_du_plat'  # Remplacez par le nom de votre colonne
+
+# Nettoyage des textes
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'[^\w\s]', '', text)  # Supprimer la ponctuation
+    return text.strip()
+
+df['cleaned'] = df[column_name].apply(clean_text)
+
+# Détection des clusters de similarité
+def find_similarity_clusters(texts, threshold=0.7):
+    # Création du modèle TF-IDF
+    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 3))
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    
+    # Utilisation de NearestNeighbors pour trouver les voisins similaires
+    nn = NearestNeighbors(n_neighbors=5, metric='cosine', algorithm='brute')
+    nn.fit(tfidf_matrix)
+    
+    clusters = []
+    visited = set()
+    
+    for i in range(len(texts)):
+        if i in visited:
+            continue
+            
+        cluster = [i]
+        visited.add(i)
+        distances, indices = nn.kneighbors(tfidf_matrix[i], n_neighbors=10)
+        
+        for j, dist in zip(indices[0], distances[0]):
+            if j == i or j in visited:
+                continue
+            if 1 - dist > threshold:  # Convertir distance en similarité
+                cluster.append(j)
+                visited.add(j)
+        
+        clusters.append(cluster)
+    
+    return clusters
+
+# Trouver les clusters
+texts = df['cleaned'].tolist()
+clusters = find_similarity_clusters(texts)
+
+# Créer un DataFrame des résultats
+results = []
+for cluster in clusters:
+    cluster_texts = [texts[i] for i in cluster]
+    representative = max(cluster_texts, key=len)  # Le texte le plus long comme représentant
+    
+    for idx in cluster:
+        results.append({
+            'original': df[column_name].iloc[idx],
+            'cleaned': texts[idx],
+            'cluster_rep': representative,
+            'cluster_id': id(representative)
+        })
+
+result_df = pd.DataFrame(results)
+
+# Sauvegarder les résultats
+result_df.to_csv('clusters_similarite.csv', index=False)
+
+# Optionnel : Calculer la matrice de similarité (pour petits datasets)
+def calculate_similarity_matrix(texts):
+    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 3))
+    tfidf_matrix = vectorizer.fit_transform(texts)
+    cos_sim = cosine_similarity(tfidf_matrix)
+    return pd.DataFrame(cos_sim, index=texts, columns=texts)
+
+# Pour datasets < 1000 lignes
+if len(df) < 1000:
+    similarity_matrix = calculate_similarity_matrix(texts)
+    similarity_matrix.to_csv('matrice_similarite.csv')
