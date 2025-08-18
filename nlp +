@@ -1,0 +1,82 @@
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import networkx as nx
+import re
+from collections import Counter
+
+# Charger les données
+df = pd.read_csv('dishes.csv')
+column_name = 'plat'
+
+# Paramètres
+SEUIL_SIMILARITE = 0.75  # Ajuster selon la sensibilité souhaitée
+NGRAM_RANGE = (2, 4)     # Trigrames et quadrigrames de caractères
+
+# 1. Nettoyage et normalisation
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'[^\w\s]', '', text)  # Supprimer la ponctuation
+    text = re.sub(r'\s+', ' ', text).strip()  # Normaliser les espaces
+    return text
+
+df['cleaned'] = df[column_name].apply(clean_text)
+
+# 2. Vectorisation avec TF-IDF sur les n-grammes de caractères
+vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=NGRAM_RANGE)
+tfidf_matrix = vectorizer.fit_transform(df['cleaned'])
+
+# 3. Calcul de la similarité cosinus
+cos_sim = cosine_similarity(tfidf_matrix)
+
+# 4. Construction du graphe de similarité
+G = nx.Graph()
+n = len(df)
+
+# Ajouter les nœuds
+for i in range(n):
+    G.add_node(i)
+
+# Ajouter les arêtes basées sur le seuil de similarité
+for i in range(n):
+    for j in range(i + 1, n):
+        if cos_sim[i, j] > SEUIL_SIMILARITE:
+            G.add_edge(i, j)
+
+# 5. Trouver les composantes connectées (clusters)
+clusters = list(nx.connected_components(G))
+
+# 6. Déterminer le nom canonique pour chaque cluster
+canonical_names = {}
+for cluster in clusters:
+    # Extraire les textes originaux du cluster
+    original_texts = [df[column_name].iloc[i] for i in cluster]
+    
+    # Stratégie 1: Fréquence d'apparition
+    counter = Counter(original_texts)
+    most_common = counter.most_common(1)[0][0]
+    
+    # Stratégie 2: Longueur du texte (suppose que les versions complètes sont plus longues)
+    longest = max(original_texts, key=len)
+    
+    # Stratégie 3: Présence de caractères spéciaux (accents, etc.)
+    has_special_chars = [text for text in original_texts if any(char in "éèêàâîïôöùûüç" for char in text)]
+    
+    # Choix hiérarchique du nom canonique
+    if has_special_chars:
+        canonical = max(has_special_chars, key=len)
+    else:
+        canonical = most_common if len(most_common) > 0.9 * len(longest) else longest
+    
+    # Assigner le nom canonique à tous les membres du cluster
+    for idx in cluster:
+        canonical_names[idx] = canonical
+
+# 7. Créer la colonne avec les noms corrigés
+df['nom_canonique'] = [canonical_names.get(i, df[column_name].iloc[i]) for i in range(len(df))]
+
+# 8. Sauvegarder les résultats
+df.to_csv('plats_corriges.csv', index=False)
+
+print("Correction terminée. Résultats sauvegardés dans 'plats_corriges.csv'")
