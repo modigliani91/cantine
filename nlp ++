@@ -1,0 +1,109 @@
+import pandas as pd
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import networkx as nx
+import re
+from collections import Counter
+import Levenshtein as lev
+
+# Charger les données
+df = pd.read_csv('dishes.csv')
+column_name = 'plat'
+
+# Paramètres ajustés
+SEUIL_COSINUS = 0.75  # Seuil plus bas pour la première passe
+SEUIL_LEVENSHTEIN = 0.85  # Seuil pour la similarité textuelle fine
+MIN_LENGTH = 8  # Longueur minimale pour appliquer les règles spéciales
+
+# 1. Nettoyage approfondi
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # Normalisations spécifiques aux fautes courantes
+    text = re.sub(r'([aeiou])\1+', r'\1', text)  # Réduire les voyelles doubles
+    text = re.sub(r'(.)\1{2,}', r'\1\1', text)   # Limiter les répétitions de lettres
+    return text
+
+df['cleaned'] = df[column_name].apply(clean_text)
+
+# 2. Vectorisation avec TF-IDF
+vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(2, 4))
+tfidf_matrix = vectorizer.fit_transform(df['cleaned'])
+cos_sim = cosine_similarity(tfidf_matrix)
+
+# 3. Construction du graphe avec double seuil
+G = nx.Graph()
+n = len(df)
+
+for i in range(n):
+    G.add_node(i)
+
+for i in range(n):
+    for j in range(i + 1, n):
+        # Calculer la similarité de Levenshtein pour les paires potentielles
+        lev_ratio = lev.ratio(df['cleaned'][i], df['cleaned'][j])
+        
+        # Règles de regroupement combinées
+        if (cos_sim[i, j] > SEUIL_COSINUS) or \
+           (lev_ratio > SEUIL_LEVENSHTEIN) or \
+           (lev_ratio > 0.8 and abs(len(df['cleaned'][i]) - len(df['cleaned'][j]) == 1):
+            G.add_edge(i, j)
+
+# 4. Fusion des clusters similaires
+clusters = list(nx.connected_components(G))
+
+# 5. Stratégie avancée de sélection du nom canonique
+def select_canonical(names):
+    # Priorité 1: Formes avec accents
+    accented = [n for n in names if any(char in "éèêàâîïôöùûüç" for char in n)]
+    if accented:
+        return max(accented, key=len)
+    
+    # Priorité 2: Formes complètes (sans abréviation)
+    full_forms = [n for n in names if not re.search(r"\b(?:sauce?|coulis?|mixte?|reduc?)\b", n)]
+    if full_forms:
+        return max(full_forms, key=len)
+    
+    # Priorité 3: Version la plus fréquente
+    counter = Counter(names)
+    most_common = counter.most_common(1)[0][0]
+    
+    # Priorité 4: Version la plus longue (si différence significative)
+    longest = max(names, key=len)
+    if len(longest) > len(most_common) + 2:
+        return longest
+    
+    return most_common
+
+# 6. Application aux clusters
+canonical_names = {}
+for cluster in clusters:
+    original_texts = [df[column_name].iloc[i] for i in cluster]
+    canonical = select_canonical(original_texts)
+    
+    for idx in cluster:
+        canonical_names[idx] = canonical
+
+# 7. Correction finale pour les mots à longueur variable
+def final_adjustment(row):
+    name = row['nom_canonique']
+    cleaned = row['cleaned']
+    
+    # Règles spécifiques pour les terminaisons
+    if re.search(r'\besee?\b', cleaned):
+        base = re.sub(r'e{1,2}\b', '', name)
+        return base + 'ée' if not base.endswith('é') else base + 'e'
+    
+    if re.search(r'\bee\b', cleaned):
+        return re.sub(r'e\b', 'ée', name)
+    
+    return name
+
+df['nom_canonique'] = [canonical_names.get(i, df[column_name].iloc[i]) for i in range(len(df))]
+df['nom_canonique'] = df.apply(final_adjustment, axis=1)
+
+# Sauvegarder
+df.to_csv('plats_corriges_ameliores.csv', index=False)
