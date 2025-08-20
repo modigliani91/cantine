@@ -1,0 +1,49 @@
+import openai
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import re
+
+# Configuration de l'API OpenAI
+openai.api_key = 'YOUR_API_KEY'
+
+# Extraction et nettoyage des noms de plats
+text_content = """[Votre contenu texte ici]"""  # Coller le texte de l'image ici
+
+lines = text_content.split('\n')
+dishes = []
+for line in lines:
+    line = re.sub(r'^\*\*|\*\*$', '', line.strip())  # Nettoyer les markdown
+    if line and not line.startswith('#') and not line.startswith('---'):
+        dishes.append(line)
+
+# Génération des embeddings avec OpenAI
+def get_embedding(text):
+    response = openai.Embedding.create(
+        input=text,
+        model="text-embedding-ada-002"
+    )
+    return response['data'][0]['embedding']
+
+embeddings = []
+for dish in dishes:
+    emb = get_embedding(dish)
+    embeddings.append(emb)
+    print(f"Embedding généré pour: {dish}")
+
+embeddings = np.array(embeddings)
+
+# Calcul des similarités
+similarity_matrix = cosine_similarity(embeddings)
+
+# Identification des paires similaires
+threshold = 0.85  # Seuil de similarité à ajuster
+similar_pairs = []
+for i in range(len(dishes)):
+    for j in range(i+1, len(dishes)):
+        if similarity_matrix[i][j] > threshold:
+            similar_pairs.append((dishes[i], dishes[j], similarity_matrix[i][j]))
+
+# Affichage des résultats
+print("\nPlats similaires trouvés:")
+for pair in similar_pairs:
+    print(f"{pair[0]} <-> {pair[1]} (score: {pair[2]:.3f})")
