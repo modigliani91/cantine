@@ -1,49 +1,139 @@
+import pandas as pd
 import openai
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import DBSCAN
 import re
 
 # Configuration de l'API OpenAI
-openai.api_key = 'YOUR_API_KEY'
+openai.api_key = 'YOUR_API_KEY'  # Remplacez par votre clé API
 
-# Extraction et nettoyage des noms de plats
-text_content = """[Votre contenu texte ici]"""  # Coller le texte de l'image ici
+# Charger les données depuis le fichier CSV
+def load_dishes_from_csv(file_path, column_name='plat'):
+    """
+    Charge les noms de plats depuis un fichier CSV
+    
+    Args:
+        file_path (str): Chemin vers le fichier CSV
+        column_name (str): Nom de la colonne contenant les noms de plats
+    
+    Returns:
+        list: Liste des noms de plats
+    """
+    try:
+        df = pd.read_csv(file_path)
+        dishes = df[column_name].dropna().unique().tolist()
+        print(f"Chargement de {len(dishes)} plats uniques depuis le CSV")
+        return dishes
+    except Exception as e:
+        print(f"Erreur lors du chargement du CSV: {e}")
+        return []
 
-lines = text_content.split('\n')
-dishes = []
-for line in lines:
-    line = re.sub(r'^\*\*|\*\*$', '', line.strip())  # Nettoyer les markdown
-    if line and not line.startswith('#') and not line.startswith('---'):
-        dishes.append(line)
+# Nettoyer les noms de plats
+def clean_dish_name(name):
+    """
+    Nettoie le nom du plat en supprimant les caractères spéciaux et en normalisant
+    """
+    if not isinstance(name, str):
+        return ""
+    
+    # Supprimer les numéros, astérisques et autres caractères spéciaux
+    name = re.sub(r'[^\w\s]', ' ', name)
+    # Remplacer les multiples espaces par un seul
+    name = re.sub(r'\s+', ' ', name)
+    # Convertir en minuscules et supprimer les espaces en début/fin
+    return name.strip().lower()
 
-# Génération des embeddings avec OpenAI
-def get_embedding(text):
-    response = openai.Embedding.create(
-        input=text,
-        model="text-embedding-ada-002"
-    )
-    return response['data'][0]['embedding']
+# Générer les embeddings avec OpenAI
+def get_embedding(text, model="text-embedding-ada-002"):
+    """
+    Génère un embedding pour le texte donné en utilisant l'API OpenAI
+    """
+    try:
+        response = openai.Embedding.create(input=[text], model=model)
+        return response['data'][0]['embedding']
+    except Exception as e:
+        print(f"Erreur lors de la génération de l'embedding pour '{text}': {e}")
+        return None
 
-embeddings = []
-for dish in dishes:
-    emb = get_embedding(dish)
-    embeddings.append(emb)
-    print(f"Embedding généré pour: {dish}")
+# Identifier et regrouper les plats similaires
+def find_similar_dishes(dishes, similarity_threshold=0.85):
+    """
+    Identifie les plats similaires en utilisant les embeddings OpenAI
+    """
+    # Nettoyer les noms de plats
+    cleaned_dishes = [clean_dish_name(dish) for dish in dishes]
+    original_to_cleaned = dict(zip(dishes, cleaned_dishes))
+    
+    # Générer les embeddings
+    print("Génération des embeddings...")
+    embeddings = []
+    valid_dishes = []
+    
+    for i, dish in enumerate(cleaned_dishes):
+        if not dish:  # Ignorer les chaînes vides
+            continue
+            
+        emb = get_embedding(dish)
+        if emb is not None:
+            embeddings.append(emb)
+            valid_dishes.append(dishes[i])  # Garder le nom original
+    
+    if not embeddings:
+        print("Aucun embedding généré. Vérifiez votre clé API et la connexion.")
+        return []
+    
+    embeddings = np.array(embeddings)
+    
+    # Calculer la matrice de similarité
+    print("Calcul des similarités...")
+    similarity_matrix = cosine_similarity(embeddings)
+    
+    # Utiliser DBSCAN pour regrouper les plats similaires
+    # Convertir la similarité en distance (1 - similarité)
+    distance_matrix = 1 - similarity_matrix
+    clustering = DBSCAN(eps=1-similarity_threshold, min_samples=1, metric='precomputed').fit(distance_matrix)
+    
+    # Regrouper les plats par cluster
+    clusters = {}
+    for i, label in enumerate(clustering.labels_):
+        if label not in clusters:
+            clusters[label] = []
+        clusters[label].append(valid_dishes[i])
+    
+    # Filtrer les clusters avec plus d'un élément (plats similaires)
+    similar_groups = [dishes for dishes in clusters.values() if len(dishes) > 1]
+    
+    return similar_groups
 
-embeddings = np.array(embeddings)
+# Fonction principale
+def main():
+    # Charger les plats depuis le CSV
+    csv_file_path = 'plats.csv'  # Remplacez par le chemin de votre fichier CSV
+    dishes = load_dishes_from_csv(csv_file_path, column_name='plat')  # Ajustez le nom de colonne si nécessaire
+    
+    if not dishes:
+        print("Aucun plat chargé. Vérifiez le fichier CSV.")
+        return
+    
+    # Trouver les plats similaires
+    similar_groups = find_similar_dishes(dishes, similarity_threshold=0.85)
+    
+    # Afficher les résultats
+    print(f"\nGroupes de plats similaires identifiés:")
+    for i, group in enumerate(similar_groups, 1):
+        print(f"Groupe {i}: {', '.join(group)}")
+    
+    # Optionnel: Sauvegarder les résultats dans un fichier
+    results = []
+    for group in similar_groups:
+        primary_name = group[0]  # Prendre le premier nom comme référence
+        for dish in group:
+            results.append({'plat_original': dish, 'plat_standardise': primary_name})
+    
+    df_results = pd.DataFrame(results)
+    df_results.to_csv('plats_standardises.csv', index=False)
+    print("\nRésultats sauvegardés dans 'plats_standardises.csv'")
 
-# Calcul des similarités
-similarity_matrix = cosine_similarity(embeddings)
-
-# Identification des paires similaires
-threshold = 0.85  # Seuil de similarité à ajuster
-similar_pairs = []
-for i in range(len(dishes)):
-    for j in range(i+1, len(dishes)):
-        if similarity_matrix[i][j] > threshold:
-            similar_pairs.append((dishes[i], dishes[j], similarity_matrix[i][j]))
-
-# Affichage des résultats
-print("\nPlats similaires trouvés:")
-for pair in similar_pairs:
-    print(f"{pair[0]} <-> {pair[1]} (score: {pair[2]:.3f})")
+if __name__ == "__main__":
+    main()
