@@ -1,0 +1,130 @@
+import os
+import pandas as pd
+import time
+from openai import AzureOpenAI
+from tenacity import retry, stop_after_attempt, wait_random_exponential
+
+# Initialize the Azure OpenAI client
+client = AzureOpenAI(
+    azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT", "https://YOUR_RESOURCE_NAME.openai.azure.com/"),
+    api_key=os.getenv("AZURE_OPENAI_API_KEY", "YOUR_API_KEY"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-11-20")
+)
+
+# Your deployment name
+deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "YOUR_DEPLOYMENT_NAME")
+
+# System prompt to guide the model behavior
+system_prompt = """
+Vous êtes un expert en linguistique culinaire spécialisé dans la standardisation des noms de plats français et algériens (Derja).
+Votre tâche est de corriger l'orthographe, la grammaire, et de standardiser le nom du plat qui vous est fourni.
+
+**Règles importantes:**
+1.  **Correction:** Corrigez les fautes d'orthographe et de frappe.
+2.  **Standardisation:** Utilisez la formulation la plus courante et standard en français. (Exemple: "spag bolo" -> "Spaghettis à la bolognaise").
+3.  **Langue:** Si le nom est en derja algérien (en écriture latine), traduisez-le en français standard, sauf si le terme est internationalement connu (ex: "Couscous", "Tajine").
+4.  **Format de réponse:** Répondez UNIQUEMENT par le nom du plat corrigé, sans ajouter de commentaires, de guillemets, de points ou d'explications.
+5.  **Respect de l'input:** Si le nom est déjà correct et standard, renvoyez-le inchangé.
+
+Exemples:
+- Input: "spag bolo" -> Output: Spaghettis à la bolognaise
+- Input: "tajin marokain" -> Output: Tajine marocain
+- Input: "pizza fromaj" -> Output: Pizza au fromage
+- Input: "كسكس" -> Output: Couscous
+- Input: "Chakhchoukha" -> Output: Chakhchoukha (le terme est standard)
+"""
+
+# Create a cache dictionary to avoid reprocessing the same meal names
+cache = {}
+
+@retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
+def correct_meal_name(meal_name):
+    """
+    Sends a meal name to Azure OpenAI for correction and standardization.
+    Uses caching to avoid duplicate API calls.
+    """
+    # Check cache first
+    if meal_name in cache:
+        return cache[meal_name]
+    
+    try:
+        response = client.chat.completions.create(
+            model=deployment_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": meal_name}
+            ],
+            temperature=0.1,  # Low temperature for consistent results
+            max_tokens=50
+        )
+        corrected_name = response.choices[0].message.content.strip()
+        
+        # Store in cache
+        cache[meal_name] = corrected_name
+        return corrected_name
+        
+    except Exception as e:
+        print(f"Error processing '{meal_name}': {e}")
+        # Return original name if error occurs
+        return meal_name
+
+def process_dataframe(df, batch_size=20, delay=0.1):
+    """
+    Process a DataFrame of meal names with batching and rate limiting.
+    """
+    # Create a new column for corrected names
+    df['plat_corrige'] = ""
+    
+    # Process each row
+    for idx, row in df.iterrows():
+        original_name = row['plat']
+        corrected_name = correct_meal_name(original_name)
+        df.at[idx, 'plat_corrige'] = corrected_name
+        
+        # Add delay to avoid rate limiting
+        time.sleep(delay)
+        
+        # Print progress
+        if (idx + 1) % batch_size == 0:
+            print(f"Processed {idx + 1} of {len(df)} rows")
+    
+    return df
+
+def main():
+    # Load your data
+    # Replace with your actual data loading code
+    # df = pd.read_csv('your_data_file.csv')
+    
+    # For demonstration, create a sample DataFrame
+    sample_data = {
+        'plat': [
+            'spag bolo', 
+            'tajin marokain', 
+            'pizza fromaj', 
+            'كسكس', 
+            'Chakhchoukha', 
+            'poisson fri',
+            'pommes frit',
+            'poulet roti',
+            'creme caramel',
+            'riz au lait'
+        ]
+    }
+    df = pd.DataFrame(sample_data)
+    
+    print("Original data:")
+    print(df)
+    
+    # Process the data
+    print("\nProcessing meal names...")
+    df = process_dataframe(df, batch_size=5, delay=0.2)
+    
+    print("\nCorrected data:")
+    print(df)
+    
+    # Save results
+    # df.to_csv('corrected_meals.csv', index=False)
+    # print("Results saved to corrected_meals.csv")
+
+if __name__ == "__main__":
+    main()
