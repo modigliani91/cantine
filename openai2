@@ -1,0 +1,127 @@
+import pandas as pd
+import openai
+from openai import AzureOpenAI
+import time
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# Initialize Azure OpenAI client
+client = AzureOpenAI(
+    api_key=AZURE_AOAI_API_KEY,
+    api_version=AZURE_AOAI_API_VERSION,
+    azure_endpoint=APIGEE_ENDPOINT if APIGEE_ENDPOINT else AZURE_AOAI_ENDPOINT,
+    # If using APIGEE endpoint, you might need additional headers
+    # default_headers={"Authorization": f"Bearer {OIDC_CLIENT_SECRET}"} if OIDC_CLIENT_SECRET else None
+)
+
+# Define deployment names
+chat_deployment_name = AZURE_AOAI_MODEL_DEPLOYMENT_NAME
+
+# Define the system message for culinary correction
+system_message = """
+Tu es un expert culinaire spécialisé dans la cuisine française et algérienne (Derja). 
+Ton rôle est de corriger l'orthographe et le sens des noms de plats sans ajouter d'explications.
+Retourne uniquement le nom corrigé, sans commentaires supplémentaires.
+
+Règles importantes:
+1. Corrige les fautes d'orthographe et les erreurs de frappe
+2. Standardise les noms de plats selon la terminologie culinaire standard
+3. Respecte les particularités de la derja algérienne quand c'est approprié
+4. Pour les plats internationaux, utilise l'orthographe standard française
+5. Garde les mêmes mots et expressions quand ils sont déjà corrects
+
+Exemples:
+- "spaghettis a la bolognaise" → "Spaghetti à la bolognaise"
+- "tajin marocain" → "Tajine marocain"
+- "couscous algerien" → "Couscous algérien"
+- "msemen" → "Msemen" (déjà correct)
+- "hrice" → "Riz"
+"""
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def correct_meal_name(meal_name):
+    """
+    Corrects the spelling and meaning of a meal name using Azure OpenAI
+    """
+    try:
+        response = client.chat.completions.create(
+            model=chat_deployment_name,
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": f"Corrige ce nom de plat : {meal_name}"}
+            ],
+            temperature=0.1,  # Low temperature for more deterministic output
+            max_tokens=50,
+            timeout=30  # Timeout in seconds
+        )
+        
+        corrected_name = response.choices[0].message.content.strip()
+        
+        # Remove any quotation marks that might be returned
+        corrected_name = corrected_name.replace('"', '').replace("'", '')
+        
+        return corrected_name
+        
+    except Exception as e:
+        print(f"Error processing '{meal_name}': {str(e)}")
+        return meal_name  # Return original if error occurs
+
+def batch_correct_meal_names(df, batch_size=10, delay_seconds=1):
+    """
+    Process meal names in batches with delay to avoid rate limiting
+    """
+    corrected_names = []
+    total_rows = len(df)
+    
+    for i in range(0, total_rows, batch_size):
+        batch = df.iloc[i:i+batch_size]
+        print(f"Processing batch {i//batch_size + 1}/{(total_rows-1)//batch_size + 1}")
+        
+        for index, row in batch.iterrows():
+            corrected_name = correct_meal_name(row['plat'])
+            corrected_names.append(corrected_name)
+            
+            # Print progress
+            print(f"Original: {row['plat']} → Corrected: {corrected_name}")
+        
+        # Delay between batches to avoid rate limiting
+        if i + batch_size < total_rows:
+            print(f"Waiting {delay_seconds} seconds before next batch...")
+            time.sleep(delay_seconds)
+    
+    return corrected_names
+
+# Example usage:
+if __name__ == "__main__":
+    # Create sample DataFrame (replace this with your actual DataFrame)
+    sample_data = {
+        'plat': [
+            'spaghettis a la bolognaise',
+            'tajin marocain',
+            'couscous algerien',
+            'msemen',
+            'hrice',
+            'chakchouka',
+            'douara',
+            'kefta',
+            'makarona',
+            'rechta'
+        ]
+    }
+    
+    df = pd.DataFrame(sample_data)
+    
+    print("Original meal names:")
+    print(df['plat'].tolist())
+    print("\nStarting correction process...\n")
+    
+    # Correct meal names
+    df['plat_corrige'] = batch_correct_meal_names(df, batch_size=5, delay_seconds=1)
+    
+    print("\nCorrection completed!")
+    print("\nFinal results:")
+    for orig, corr in zip(df['plat'], df['plat_corrige']):
+        print(f"{orig} → {corr}")
+    
+    # Save to CSV if needed
+    df.to_csv('meals_corrected.csv', index=False)
+    print("\nResults saved to 'meals_corrected.csv'")
