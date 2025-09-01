@@ -1,0 +1,207 @@
+import pandas as pd
+import numpy as np
+from sklearn.cluster import AgglomerativeClustering, KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import re
+from collections import Counter
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def improved_group_similar_meals(df, method="agglomerative", n_clusters=None):
+    """
+    Improved method for grouping similar meals with multiple techniques
+    """
+    print("Generating TF-IDF features for meal names...")
+    
+    # Preprocess text: lowercase, remove special characters but keep French accents
+    preprocessed_meals = [re.sub(r'[^\w\sàâäéèêëîïôöùûüÿç]', '', str(meal).lower()) 
+                         for meal in df['plat_corrige']]
+    
+    # Create TF-IDF features
+    vectorizer = TfidfVectorizer(
+        max_features=500,
+        min_df=2,
+        max_df=0.8,
+        ngram_range=(1, 2),  # Include single words and bigrams
+        stop_words=None  # Don't remove French stop words as they might be important for dish names
+    )
+    
+    tfidf_matrix = vectorizer.fit_transform(preprocessed_meals)
+    
+    # Calculate cosine similarity
+    similarity_matrix = cosine_similarity(tfidf_matrix)
+    
+    # Convert to distance matrix (ensure no negative values)
+    distance_matrix = 1 - similarity_matrix
+    distance_matrix = np.clip(distance_matrix, 0, 1)  # Ensure values between 0-1
+    
+    # Determine optimal number of clusters if not specified
+    if n_clusters is None:
+        # Try to find optimal number of clusters using silhouette score
+        silhouette_scores = []
+        possible_clusters = range(2, min(50, len(df) // 2))  # Try up to 50 clusters
+        
+        for n in possible_clusters:
+            if method == "agglomerative":
+                clustering = AgglomerativeClustering(n_clusters=n, affinity='precomputed', linkage='average')
+            else:
+                clustering = KMeans(n_clusters=n, random_state=42)
+                
+            if method == "agglomerative":
+                clusters = clustering.fit_predict(distance_matrix)
+            else:
+                # For KMeans, we need to use the feature matrix directly
+                clusters = clustering.fit_predict(tfidf_matrix.toarray())
+                
+            if len(set(clusters)) > 1:  # Need at least 2 clusters for silhouette score
+                if method == "agglomerative":
+                    score = silhouette_score(distance_matrix, clusters, metric='precomputed')
+                else:
+                    score = silhouette_score(tfidf_matrix, clusters)
+                silhouette_scores.append(score)
+            else:
+                silhouette_scores.append(-1)
+        
+        # Find the optimal number of clusters
+        optimal_n = possible_clusters[np.argmax(silhouette_scores)]
+        print(f"Optimal number of clusters: {optimal_n} (based on silhouette score)")
+        n_clusters = optimal_n
+        
+        # Plot silhouette scores (optional)
+        plt.figure(figsize=(10, 6))
+        plt.plot(possible_clusters, silhouette_scores, 'bo-')
+        plt.xlabel('Number of clusters')
+        plt.ylabel('Silhouette Score')
+        plt.title('Silhouette Score for Different Numbers of Clusters')
+        plt.grid(True)
+        plt.savefig('silhouette_scores.png')
+        plt.close()
+    
+    # Perform clustering with optimal number
+    if method == "agglomerative":
+        clustering = AgglomerativeClustering(
+            n_clusters=n_clusters, 
+            affinity='precomputed', 
+            linkage='average'
+        )
+        clusters = clustering.fit_predict(distance_matrix)
+    else:
+        clustering = KMeans(n_clusters=n_clusters, random_state=42)
+        clusters = clustering.fit_predict(tfidf_matrix.toarray())
+    
+    # Add clusters to dataframe
+    df['cluster_id'] = clusters
+    
+    # Find representative names for each cluster
+    cluster_names = {}
+    for cluster_id in set(clusters):
+        cluster_meals = df[df['cluster_id'] == cluster_id]['plat_corrige'].tolist()
+        
+        # Strategy 1: Find the most common meal name in the cluster
+        most_common = Counter(cluster_meals).most_common(1)[0][0]
+        
+        # Strategy 2: For small clusters, use the shortest name (often the most generic)
+        if len(cluster_meals) <= 3:
+            shortest_name = min(cluster_meals, key=len)
+            cluster_names[cluster_id] = shortest_name
+        else:
+            cluster_names[cluster_id] = most_common
+    
+    df['meal_group'] = df['cluster_id'].map(cluster_names)
+    
+    return df
+
+def analyze_cluster_sizes(df):
+    """Analyze and display cluster sizes to identify potential issues"""
+    cluster_sizes = df['cluster_id'].value_counts()
+    
+    print("Cluster size distribution:")
+    print(cluster_sizes.describe())
+    
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    cluster_sizes.hist(bins=30)
+    plt.title('Distribution of Cluster Sizes')
+    plt.xlabel('Cluster Size')
+    plt.ylabel('Frequency')
+    
+    plt.subplot(1, 2, 2)
+    plt.boxplot(cluster_sizes)
+    plt.title('Boxplot of Cluster Sizes')
+    plt.ylabel('Cluster Size')
+    
+    plt.tight_layout()
+    plt.savefig('cluster_size_analysis.png')
+    plt.close()
+    
+    # Identify very large clusters that might need splitting
+    large_clusters = cluster_sizes[cluster_sizes > len(df) * 0.1]  # Clusters with >10% of data
+    if not large_clusters.empty:
+        print(f"\nLarge clusters that might need further splitting:")
+        for cluster_id, size in large_clusters.items():
+            cluster_meals = df[df['cluster_id'] == cluster_id]['plat_corrige'].tolist()
+            print(f"Cluster {cluster_id} ({size} meals): {cluster_meals[:5]}...")
+    
+    return large_clusters
+
+def split_large_clusters(df, large_clusters, min_size=10):
+    """Further split large clusters that might contain multiple dish types"""
+    for cluster_id, size in large_clusters.items():
+        if size > min_size:
+            cluster_data = df[df['cluster_id'] == cluster_id].copy()
+            sub_clusters = improved_group_similar_meals(
+                cluster_data, 
+                method="agglomerative", 
+                n_clusters=max(2, size // 10)  # Split into roughly 10-meal clusters
+            )
+            
+            # Update the cluster IDs and names
+            max_cluster_id = df['cluster_id'].max()
+            sub_clusters['cluster_id'] = sub_clusters['cluster_id'] + max_cluster_id + 1
+            
+            # Update the meal group names
+            for new_cluster_id in sub_clusters['cluster_id'].unique():
+                cluster_meals = sub_clusters[sub_clusters['cluster_id'] == new_cluster_id]['plat_corrige'].tolist()
+                most_common = Counter(cluster_meals).most_common(1)[0][0]
+                sub_clusters.loc[sub_clusters['cluster_id'] == new_cluster_id, 'meal_group'] = most_common
+            
+            # Replace the original cluster with the split clusters
+            df = df[df['cluster_id'] != cluster_id]  # Remove the original cluster
+            df = pd.concat([df, sub_clusters], ignore_index=True)
+    
+    return df
+
+# Update your main execution block
+if __name__ == "__main__":
+    # ... (load your DataFrame with corrected meals)
+    
+    print("Starting improved grouping process...")
+    
+    # First pass grouping
+    df = improved_group_similar_meals(df, method="agglomerative")
+    
+    # Analyze cluster sizes
+    large_clusters = analyze_cluster_sizes(df)
+    
+    # Split any overly large clusters
+    if not large_clusters.empty:
+        print("Splitting large clusters...")
+        df = split_large_clusters(df, large_clusters)
+        
+        # Re-analyze after splitting
+        analyze_cluster_sizes(df)
+    
+    # Manual review and adjustment
+    df = review_and_adjust_clusters(df)
+    
+    # Save results
+    df.to_csv('meals_improved_grouping.csv', index=False)
+    print("Improved grouping completed and saved to 'meals_improved_grouping.csv'")
+    
+    # Display final cluster statistics
+    final_cluster_sizes = df['meal_group'].value_counts()
+    print(f"\nFinal grouping: {len(final_cluster_sizes)} distinct meal groups")
+    print("Top 10 meal groups:")
+    print(final_cluster_sizes.head(10))
