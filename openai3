@@ -1,0 +1,128 @@
+import numpy as np
+from sklearn.cluster import DBSCAN
+from sklearn.metrics.pairwise import cosine_similarity
+
+# Function to get embeddings for meal names
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_embedding(text):
+    """
+    Get embedding for text using Azure OpenAI
+    """
+    try:
+        response = client.embeddings.create(
+            model=AZURE_AOAI_EMBEDDING_DEPLOYMENT_NAME,
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        print(f"Error getting embedding for '{text}': {str(e)}")
+        return None
+
+def group_similar_meals(df, similarity_threshold=0.85):
+    """
+    Group similar meals using embeddings and clustering
+    """
+    print("Generating embeddings for meal names...")
+    
+    # Get embeddings for all corrected meal names
+    embeddings = []
+    valid_indices = []
+    
+    for i, meal in enumerate(df['plat_corrige']):
+        embedding = get_embedding(meal)
+        if embedding is not None:
+            embeddings.append(embedding)
+            valid_indices.append(i)
+        # Add a small delay to avoid rate limiting
+        time.sleep(0.1)
+    
+    if not embeddings:
+        print("No embeddings generated. Returning original data.")
+        df['meal_group'] = df['plat_corrige']
+        return df
+    
+    # Convert to numpy array
+    embedding_matrix = np.array(embeddings)
+    
+    # Calculate cosine similarity matrix
+    print("Calculating similarity matrix...")
+    similarity_matrix = cosine_similarity(embedding_matrix)
+    
+    # Use DBSCAN clustering to group similar meals
+    print("Clustering similar meals...")
+    # Convert similarity to distance (1 - similarity)
+    distance_matrix = 1 - similarity_matrix
+    # Use DBSCAN with eps based on similarity threshold
+    clustering = DBSCAN(eps=1-similarity_threshold, min_samples=1, metric='precomputed')
+    clusters = clustering.fit_predict(distance_matrix)
+    
+    # Create a mapping of cluster IDs to representative meal names
+    cluster_rep_names = {}
+    for cluster_id in set(clusters):
+        cluster_indices = np.where(clusters == cluster_id)[0]
+        # Get the meal names in this cluster
+        cluster_meals = [df.iloc[valid_indices[i]]['plat_corrige'] for i in cluster_indices]
+        # Find the most common meal name in the cluster
+        most_common = max(set(cluster_meals), key=cluster_meals.count)
+        cluster_rep_names[cluster_id] = most_common
+    
+    # Add cluster information to DataFrame
+    df['cluster_id'] = -1  # Initialize with -1 (no cluster)
+    for i, orig_idx in enumerate(valid_indices):
+        df.at[orig_idx, 'cluster_id'] = clusters[i]
+    
+    # Add representative meal name for each cluster
+    df['meal_group'] = df['cluster_id'].map(cluster_rep_names)
+    
+    # For rows without embeddings, use the original corrected name
+    df['meal_group'].fillna(df['plat_corrige'], inplace=True)
+    
+    return df
+
+# Function to manually review and adjust clusters
+def review_and_adjust_clusters(df):
+    """
+    Manual review of clusters to ensure accuracy
+    """
+    print("\nReviewing clusters...")
+    
+    # Group by cluster and show examples
+    cluster_groups = df.groupby('meal_group')
+    
+    for group_name, group_data in cluster_groups:
+        if len(group_data) > 1:
+            print(f"\nGroup: {group_name}")
+            print(f"Contains {len(group_data)} meals:")
+            for _, row in group_data.iterrows():
+                print(f"  - {row['plat_corrige']} (originally: {row['plat']})")
+            
+            # Ask if this grouping makes sense
+            response = input("Does this grouping make sense? (y/n): ")
+            if response.lower() == 'n':
+                new_name = input("Enter a better group name (or press enter to keep as is): ")
+                if new_name:
+                    df.loc[df['cluster_id'] == group_data['cluster_id'].iloc[0], 'meal_group'] = new_name
+    
+    return df
+
+# Add to the main execution block
+if __name__ == "__main__":
+    # ... (previous code for correction)
+    
+    print("\nGrouping similar meals...")
+    # Group similar meals with a high similarity threshold
+    df = group_similar_meals(df, similarity_threshold=0.88)
+    
+    # Manual review of clusters
+    df = review_and_adjust_clusters(df)
+    
+    print("\nFinal grouped meals:")
+    for group_name, group_data in df.groupby('meal_group'):
+        if len(group_data) > 1:
+            print(f"\n{group_name}:")
+            for _, row in group_data.iterrows():
+                print(f"  - {row['plat_corrige']} (originally: {row['plat']})")
+    
+    # Save final results
+    df.to_csv('meals_grouped.csv', index=False)
+    print("\nFinal results saved to 'meals_grouped.csv'")
