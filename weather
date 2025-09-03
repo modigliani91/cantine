@@ -1,0 +1,33 @@
+import ee
+import pandas as pd
+
+# Authenticate and initialize
+ee.Authenticate()
+ee.Initialize(project='your-project-name')
+
+# Define location (Dar el Beïda coordinates)
+latitude = 36.68
+longitude = 3.25
+point = ee.Geometry.Point([longitude, latitude])
+
+# Define date range
+start_date = '2022-01-01'
+end_date = '2024-12-31'
+
+# Load ERA5 dataset
+dataset = ee.ImageCollection('ECMWF/ERA5/DAILY') \
+    .filterDate(start_date, end_date) \
+    .filterBounds(point)
+
+# Extract relevant weather variables
+def extract_data(image):
+    date = image.get('system:time_start')
+    value = image.reduceRegion(ee.Reducer.mean(), point, 1000).get('temperature_2m')
+    return ee.Feature(None, {'date': date, 'temperature': value})
+
+
+# Convert to pandas DataFrame and save
+df = pd.DataFrame(data.getInfo())
+df.to_csv('historical_weather_dar_el_beida.csv', index=False)
+
+data = dataset.map(extract_data)
