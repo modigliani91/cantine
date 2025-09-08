@@ -1,0 +1,247 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Load your data
+# df = pd.read_csv('your_cantine_data.csv')
+
+# Data Preparation
+def prepare_data(df):
+    # Convert date to datetime if not already
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Filter out weekends (Friday and Saturday)
+    # In Algeria, weekend is Friday (6) and Saturday (7) if jour num: 1=Sunday, 2=Monday, ..., 7=Saturday
+    df = df[~df['jour num'].isin([5, 6])]  # Assuming 5=Friday, 6=Saturday
+    
+    # Add season feature based on month
+    def get_season(month):
+        if month in [12, 1, 2]:
+            return 'winter'
+        elif month in [3, 4, 5]:
+            return 'spring'
+        elif month in [6, 7, 8]:
+            return 'summer'
+        else:
+            return 'autumn'
+    
+    df['season'] = df['mois'].apply(get_season)
+    
+    # One-hot encode season
+    season_dummies = pd.get_dummies(df['season'], prefix='season')
+    df = pd.concat([df, season_dummies], axis=1)
+    
+    # One-hot encode hijri month
+    hijri_month_dummies = pd.get_dummies(df['hijri month'], prefix='hijri_month')
+    df = pd.concat([df, hijri_month_dummies], axis=1)
+    
+    # Drop columns that won't be available for prediction
+    df = df.drop(['hijri month', 'season', 'nb_entrees_HO', 'raio'], axis=1)
+    
+    return df
+
+# Prepare the data
+df_prepared = prepare_data(df)
+
+# Split into features and target
+X = df_prepared.drop(['nb_entrees_cantine', 'date'], axis=1)
+y = df_prepared['nb_entrees_cantine']
+
+# Chronological train-test split (80-20)
+split_idx = int(len(X) * 0.8)
+X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+dates_test = df_prepared['date'].iloc[split_idx:]
+
+# Model Comparison
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import xgboost as xgb
+
+models = {
+    'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42),
+    'Gradient Boosting': GradientBoostingRegressor(n_estimators=100, random_state=42),
+    'XGBoost': xgb.XGBRegressor(n_estimators=100, random_state=42),
+    'SVR': SVR(kernel='rbf', C=1.0, epsilon=0.1),
+    'Neural Network': MLPRegressor(hidden_layer_sizes=(100, 50), max_iter=1000, random_state=42)
+}
+
+# Train and evaluate models
+results = {}
+predictions = {}
+
+for name, model in models.items():
+    print(f"Training {name}...")
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    
+    # Store predictions
+    predictions[name] = y_pred
+    
+    # Calculate metrics
+    mae = mean_absolute_error(y_test, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+    
+    results[name] = {
+        'MAE': mae,
+        'RMSE': rmse,
+        'R2': r2
+    }
+
+# Display results
+print("\nModel Performance Comparison:")
+print("=" * 60)
+for name, metrics in results.items():
+    print(f"{name}:")
+    print(f"  MAE: {metrics['MAE']:.2f}")
+    print(f"  RMSE: {metrics['RMSE']:.2f}")
+    print(f"  R2: {metrics['R2']:.4f}")
+    print("-" * 40)
+
+# Find the best model based on RMSE
+best_model_name = min(results, key=lambda x: results[x]['RMSE'])
+best_model = models[best_model_name]
+print(f"\nBest model: {best_model_name}")
+
+# Show predictions for test dates
+test_results = pd.DataFrame({
+    'Date': dates_test,
+    'Actual': y_test.values
+})
+
+for name in models.keys():
+    test_results[name] = predictions[name]
+
+print("\nPredictions for Test Dates:")
+print(test_results.head(10))
+
+# Prepare future data for this week
+def prepare_future_data(start_date, days=7):
+    """
+    Prepare feature data for future dates based on known information
+    """
+    future_dates = [start_date + timedelta(days=i) for i in range(days)]
+    
+    future_data = []
+    for date in future_dates:
+        # Skip weekends (Friday and Saturday)
+        if date.weekday() in [4, 5]:  # 4=Friday, 5=Saturday
+            continue
+            
+        # These are the features we know or can get forecasts for
+        day_features = {
+            'jour': date.day,
+            'mois': date.month,
+            'annee': date.year,
+            'jour alpha': date.strftime('%A'),
+            'jour num': date.isoweekday(),  # Monday=1, Sunday=7
+            'hijri day': 1,  # Placeholder - need to calculate hijri date
+            'conge scolaires': 0,  # Placeholder - need to get school calendar
+            'jeunes': 0,  # Placeholder - need religious calendar
+            'temperature': 25,  # Placeholder - get from weather forecast
+            'vitesse du vent': 10,  # Placeholder - get from weather forecast
+            'clair': 1,  # Placeholder - get from weather forecast
+            'nuageux': 0,  # Placeholder - get from weather forecast
+            'fortement nuageux': 0,  # Placeholder - get from weather forecast
+            'pluie': 0,  # Placeholder - get from weather forecast
+            'BEM': 0,  # Placeholder - need exam calendar
+            'BAC': 0,  # Placeholder - need exam calendar
+        }
+        
+        # Add season dummies
+        season = get_season(date.month)
+        for s in ['winter', 'spring', 'summer', 'autumn']:
+            day_features[f'season_{s}'] = 1 if season == s else 0
+        
+        # Add hijri month dummies (would need to calculate hijri date)
+        # For simplicity, we'll assume all zeros - in practice you'd need a hijri calendar
+        hijri_months = [col for col in X.columns if col.startswith('hijri_month_')]
+        for month in hijri_months:
+            day_features[month] = 0
+        
+        future_data.append(day_features)
+    
+    return pd.DataFrame(future_data)
+
+# Get tomorrow's date as start date for forecasting
+start_date = datetime.now().date() + timedelta(days=1)
+future_dates_features = prepare_future_data(start_date)
+
+# Make sure future_dates_features has the same columns as X
+for col in X.columns:
+    if col not in future_dates_features.columns:
+        future_dates_features[col] = 0
+
+future_dates_features = future_dates_features[X.columns]
+
+# Predict using the best model
+future_predictions = best_model.predict(future_dates_features)
+
+# Display predictions for this week
+print("\nPredictions for This Week:")
+future_dates = [start_date + timedelta(days=i) for i in range(7) if (start_date + timedelta(days=i)).weekday() not in [4, 5]]
+for i, date in enumerate(future_dates):
+    print(f"{date}: {future_predictions[i]:.0f} meals")
+
+# Calculate optimal order quantity
+# Considering both minimizing waste and avoiding shortage
+optimal_order = np.percentile(future_predictions, 75)  # 75th percentile to reduce shortage risk
+print(f"\nRecommended daily order quantity: {optimal_order:.0f} meals")
+
+# Feature importance from the best model (if tree-based)
+if hasattr(best_model, 'feature_importances_'):
+    feature_importance = pd.DataFrame({
+        'feature': X.columns,
+        'importance': best_model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    
+    print("\nTop 10 most important features:")
+    print(feature_importance.head(10))
+
+# Use Azure OpenAI for additional insights
+try:
+    from openai import AzureOpenAI
+    
+    # Set up Azure OpenAI client
+    client = AzureOpenAI(
+        api_key=AZURE_AOAI_API_KEY,  
+        api_version=AZURE_AOAI_API_VERSION,
+        azure_endpoint=APIGEE_ENDPOINT
+    )
+    
+    # Create prompt for analysis
+    prompt = f"""
+    As a data scientist analyzing meal consumption patterns at an Algerian company cantine, I have built a predictive model with the following performance:
+    - Best model: {best_model_name}
+    - MAE: {results[best_model_name]['MAE']:.2f}
+    - RMSE: {results[best_model_name]['RMSE']:.2f}
+    - R2: {results[best_model_name]['R2']:.4f}
+    
+    The most important features in the model are: {feature_importance['feature'].head(5).tolist() if 'feature_importance' in locals() else 'Not available'}
+    
+    Based on this information and your knowledge of factors affecting meal consumption in Algeria, please provide:
+    1. Key insights about what drives meal consumption variations
+    2. Recommendations for optimizing meal orders
+    3. Any cultural or regional factors specific to Algeria that should be considered
+    """
+    
+    response = client.chat.completions.create(
+        model=AZURE_AOAI_MODEL_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "You are a data scientist specializing in time series forecasting and pattern recognition with knowledge of Algerian culture and business practices."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=800
+    )
+    
+    insights = response.choices[0].message.content
+    print("\nInsights from Azure OpenAI:")
+    print(insights)
+    
+except Exception as e:
+    print(f"Error getting insights from Azure OpenAI: {e}")
