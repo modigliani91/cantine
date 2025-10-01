@@ -1,0 +1,225 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+import joblib
+
+# ----------------------------
+# 1. Prepare the Historical Data
+# ----------------------------
+
+# Load your historical DataFrame
+# df = pd.read_csv('your_3_years_historical_data.csv')
+
+# Ensure the target 'ratio' is calculated correctly if not already present
+# df['ratio'] = df['nb_entrees_cantine'] / df['nb_entrees_HO']
+
+# Handle infinite values and missing values in the target created by division by zero
+df['ratio'] = df['ratio'].replace([np.inf, -np.inf], np.nan)
+df = df.dropna(subset=['ratio'])
+
+# Define features and target
+feature_columns = [
+    'jour', 'mois', 'annee', 'conge_scolaires', 'jeunes', 'temperature',
+    'vitesse du vent', 'clair', 'nuageux', 'fortement nuageux', 'pluie',
+    'BEM', 'BAC', 'hiver', 'printemps', 'ete', 'automne'
+]
+# Include encoded Hijri and day of week
+categorical_columns = ['hijri month', 'jour alpha'] 
+
+# Preprocess categorical features
+label_encoders = {}
+for col in categorical_columns:
+    le = LabelEncoder()
+    df[col + '_encoded'] = le.fit_transform(df[col])
+    label_encoders[col] = le
+    feature_columns.append(col + '_encoded')
+
+# Separate features and target
+X = df[feature_columns].copy()
+y = df['ratio'].values
+
+# Split data chronologically (important for time series)
+# Use the first 80% for training, the last 20% for validation
+split_index = int(0.8 * len(df))
+X_train, X_val = X.iloc[:split_index], X.iloc[split_index:]
+y_train, y_val = y[:split_index], y[split_index:]
+
+# Scale numerical features
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+
+# Save the scaler for future use
+joblib.dump(scaler, 'scaler.pkl')
+
+# Convert to PyTorch tensors:cite[8]
+X_train_tensor = torch.tensor(X_train_scaled, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+X_val_tensor = torch.tensor(X_val_scaled, dtype=torch.float32)
+y_val_tensor = torch.tensor(y_val, dtype=torch.float32).view(-1, 1)
+
+# Create DataLoaders
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32)
+
+# ----------------------------
+# 2. Define the Neural Network
+# ----------------------------
+
+class RatioPredictor(nn.Module):
+    def __init__(self, input_size):
+        super(RatioPredictor, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+    
+    def forward(self, x):
+        return self.network(x)
+
+# Initialize model
+input_size = X_train_tensor.shape[1]
+model = RatioPredictor(input_size)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# ----------------------------
+# 3. Train the Model
+# ----------------------------
+
+num_epochs = 200
+train_losses = []
+val_losses = []
+
+for epoch in range(num_epochs):
+    # Training phase
+    model.train()
+    train_loss = 0
+    for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        y_pred = model(X_batch)
+        loss = criterion(y_pred, y_batch)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+    
+    # Validation phase
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            y_pred = model(X_batch)
+            loss = criterion(y_pred, y_batch)
+            val_loss += loss.item()
+    
+    # Store losses
+    train_losses.append(train_loss / len(train_loader))
+    val_losses.append(val_loss / len(val_loader))
+    
+    if (epoch + 1) % 50 == 0:
+        print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_losses[-1]:.4f}, Val Loss: {val_losses[-1]:.4f}')
+
+# Save the trained model
+torch.save(model.state_dict(), 'meal_ratio_predictor.pkl')
+
+# ----------------------------
+# 4. Deploy for the Next Week
+# ----------------------------
+
+def prepare_future_data(future_dates_df, label_encoders, scaler, feature_columns):
+    """
+    Preprocesses the future data to match the training format.
+    
+    Args:
+        future_dates_df: DataFrame with the same features as training data, except 'ratio' and entry counts.
+        label_encoders: Dictionary of saved label encoders.
+        scaler: The saved StandardScaler object.
+        feature_columns: List of feature column names used in training.
+    
+    Returns:
+        A PyTorch tensor ready for the model.
+    """
+    # Create a copy to avoid modifying the original
+    df_future = future_dates_df.copy()
+    
+    # Encode categorical columns
+    for col in ['hijri month', 'jour alpha']:
+        le = label_encoders[col]
+        # Handle unseen labels by assigning a default value (e.g., -1)
+        df_future[col + '_encoded'] = df_future[col].apply(lambda x: x if x in le.classes_ else 'unknown')
+        df_future[col + '_encoded'] = le.transform(df_future[col + '_encoded'])
+    
+    # Ensure all feature columns are present
+    for col in feature_columns:
+        if col not in df_future.columns:
+            # This should not happen if preparation is correct
+            raise ValueError(f"Missing feature column: {col}")
+    
+    # Select and scale features
+    X_future = df_future[feature_columns]
+    X_future_scaled = scaler.transform(X_future)
+    
+    # Convert to tensor
+    X_future_tensor = torch.tensor(X_future_scaled, dtype=torch.float32)
+    return X_future_tensor
+
+def predict_next_week(model, future_data_tensor, last_known_employee_avg):
+    """
+    Predicts the number of meals needed for the next week.
+    
+    Args:
+        model: The trained PyTorch model.
+        future_data_tensor: Preprocessed tensor for the upcoming week.
+        last_known_employee_avg: The average number of employees from the previous week.
+    
+    Returns:
+        A DataFrame with predictions for each day.
+    """
+    model.eval()
+    with torch.no_grad():
+        predicted_ratios = model(future_data_tensor).numpy().flatten()
+    
+    # Calculate predicted meals
+    predicted_meals = predicted_ratios * last_known_employee_avg
+    
+    return predicted_ratios, predicted_meals
+
+# --- Example Usage for Weekly Deployment ---
+
+# Suppose you have a DataFrame 'next_week_df' for the upcoming 7 days.
+# It must contain all the original features except 'nb_entrees_HO', 'nb_entrees_cantine', and 'ratio'.
+# You have obtained weather forecasts:cite[10] and other data for these dates.
+
+# Load the saved scaler and model
+scaler = joblib.load('scaler.pkl')
+model = RatioPredictor(input_size)
+model.load_state_dict(torch.load('meal_ratio_predictor.pkl'))
+
+# Calculate the average number of employees from the most recent available data (e.g., last week)
+last_week_employee_avg = df['nb_entrees_HO'].tail(7).mean()
+
+# Prepare the future data tensor
+future_tensor = prepare_future_data(next_week_df, label_encoders, scaler, feature_columns)
+
+# Make predictions
+predicted_ratios, predicted_meals = predict_next_week(model, future_tensor, last_week_employee_avg)
+
+# Create a results summary
+next_week_df['predicted_ratio'] = predicted_ratios
+next_week_df['predicted_meals'] = predicted_meals
+next_week_df['recommended_order'] = np.round(predicted_meals) # Round to nearest whole meal
+
+print(next_week_df[['date', 'predicted_meals', 'recommended_order']])
