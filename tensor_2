@@ -1,0 +1,436 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
+
+class CantineForecaster:
+    def __init__(self, sequence_length=30, forecast_horizon=7):
+        self.sequence_length = sequence_length
+        self.forecast_horizon = forecast_horizon
+        self.feature_scaler = StandardScaler()
+        self.target_scaler = MinMaxScaler()
+        self.model = None
+        self.feature_columns = None
+        self.train_history = None
+        
+    def prepare_features(self, df):
+        """Prepare and select features for the model with comprehensive feature engineering"""
+        # Define base feature columns
+        feature_columns = [
+            'jour', 'mois', 'annee', 'hijri day', 'conge scolaires', 'jeunes', 
+            'temperature', 'vitesse du vent', 'clair', 'nuageux', 'fortement nuageux', 
+            'pluie', 'BEM', 'BAC', 'hiver', 'printemps', 'ete', 'automne'
+        ]
+        
+        # Convert 'jour alpha' to cyclical features
+        days_of_week = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi']
+        df['jour_alpha_num'] = df['jour alpha'].apply(lambda x: days_of_week.index(x) if x in days_of_week else 0)
+        
+        # Cyclical encoding for day of week
+        df['jour_alpha_sin'] = np.sin(2 * np.pi * df['jour_alpha_num'] / 7)
+        df['jour_alpha_cos'] = np.cos(2 * np.pi * df['jour_alpha_num'] / 7)
+        feature_columns.extend(['jour_alpha_sin', 'jour_alpha_cos'])
+        
+        # Convert hijri month to numerical
+        hijri_month_mapping = {month: idx for idx, month in enumerate(df['hijri month'].unique())}
+        df['hijri_month_num'] = df['hijri month'].map(hijri_month_mapping)
+        feature_columns.append('hijri_month_num')
+        
+        # Lag features for target variable
+        df['nb_entrees_cantine_lag1'] = df['nb_entrees_cantine'].shift(1)
+        df['nb_entrees_cantine_lag7'] = df['nb_entrees_cantine'].shift(7)
+        df['nb_entrees_cantine_rolling_mean_7'] = df['nb_entrees_cantine'].rolling(7).mean()
+        
+        # Fill NaN values from lag features
+        df = df.fillna(method='bfill')
+        feature_columns.extend(['nb_entrees_cantine_lag1', 'nb_entrees_cantine_lag7', 'nb_entrees_cantine_rolling_mean_7'])
+        
+        self.feature_columns = feature_columns
+        return df[feature_columns], df['nb_entrees_cantine']
+    
+    def create_sequences(self, features, target):
+        """Convert 2D data to 3D tensors for sequence learning"""
+        X, y = [], []
+        
+        for i in range(len(features) - self.sequence_length - self.forecast_horizon + 1):
+            X_seq = features[i:(i + self.sequence_length)]
+            y_seq = target[(i + self.sequence_length):(i + self.sequence_length + self.forecast_horizon)]
+            
+            X.append(X_seq)
+            y.append(y_seq)
+        
+        return np.array(X), np.array(y)
+    
+    def calculate_regression_metrics(self, y_true, y_pred):
+        """Calculate comprehensive regression metrics for accuracy assessment"""
+        mae = mean_absolute_error(y_true, y_pred)
+        mse = mean_squared_error(y_true, y_pred)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_true, y_pred)
+        
+        # Mean Absolute Percentage Error (MAPE)
+        mape = np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), 1))) * 100
+        
+        return {
+            'MAE': mae,
+            'MSE': mse, 
+            'RMSE': rmse,
+            'R2': r2,
+            'MAPE': mape
+        }
+    
+    def build_model(self, input_shape):
+        """Build LSTM-based model with regularization to prevent overfitting"""
+        model = keras.Sequential([
+            layers.LSTM(128, return_sequences=True, input_shape=input_shape,
+                       dropout=0.2, recurrent_dropout=0.2,
+                       kernel_regularizer=keras.regularizers.l2(0.001)),
+            layers.BatchNormalization(),
+            layers.LSTM(64, return_sequences=True, dropout=0.2, recurrent_dropout=0.2,
+                       kernel_regularizer=keras.regularizers.l2(0.001)),
+            layers.BatchNormalization(),
+            layers.LSTM(32, dropout=0.2, recurrent_dropout=0.2,
+                       kernel_regularizer=keras.regularizers.l2(0.001)),
+            layers.BatchNormalization(),
+            layers.Dense(64, activation='relu', kernel_regularizer=keras.regularizers.l2(0.001)),
+            layers.Dropout(0.3),
+            layers.Dense(32, activation='relu'),
+            layers.Dropout(0.2),
+            layers.Dense(self.forecast_horizon)
+        ])
+        
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=0.001),
+            loss='mse',
+            metrics=['mae', 'mse']
+        )
+        
+        return model
+    
+    def train(self, df, validation_split=0.2, epochs=100, batch_size=32):
+        """Train the forecasting model with comprehensive evaluation"""
+        # Prepare features and target
+        df_processed, target = self.prepare_features(df)
+        
+        # Scale features and target
+        features_scaled = self.feature_scaler.fit_transform(df_processed)
+        target_scaled = self.target_scaler.fit_transform(target.values.reshape(-1, 1)).flatten()
+        
+        # Create sequences
+        X, y = self.create_sequences(features_scaled, target_scaled)
+        
+        print(f"Created sequences: {X.shape} -> {y.shape}")
+        
+        # Use time series split for validation
+        tscv = TimeSeriesSplit(n_splits=5)
+        
+        # Build model
+        self.model = self.build_model((self.sequence_length, X.shape[2]))
+        
+        # For simplicity, using standard train/val split
+        split_idx = int(len(X) * (1 - validation_split))
+        X_train, X_val = X[:split_idx], X[split_idx:]
+        y_train, y_val = y[:split_idx], y[split_idx:]
+        
+        # Callbacks for training
+        early_stopping = keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=20,
+            restore_best_weights=True,
+            verbose=1
+        )
+        
+        reduce_lr = keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=10,
+            verbose=1
+        )
+        
+        # Train model
+        history = self.model.fit(
+            X_train, y_train,
+            batch_size=batch_size,
+            epochs=epochs,
+            validation_data=(X_val, y_val),
+            callbacks=[early_stopping, reduce_lr],
+            verbose=1
+        )
+        
+        self.train_history = history.history
+        
+        # Comprehensive model evaluation
+        self._evaluate_model_fit(X_train, y_train, X_val, y_val)
+        
+        return history
+    
+    def _evaluate_model_fit(self, X_train, y_train, X_val, y_val):
+        """Evaluate if model is overfitting or underfitting using multiple metrics"""
+        # Get predictions
+        train_pred = self.model.predict(X_train)
+        val_pred = self.model.predict(X_val)
+        
+        # Calculate metrics for both sets
+        train_metrics = self.calculate_regression_metrics(y_train.flatten(), train_pred.flatten())
+        val_metrics = self.calculate_regression_metrics(y_val.flatten(), val_pred.flatten())
+        
+        print("\n" + "="*70)
+        print("COMPREHENSIVE MODEL FIT DIAGNOSIS")
+        print("="*70)
+        
+        # Display accuracy metrics
+        print(f"\n📊 ACCURACY METRICS:")
+        metrics_df = pd.DataFrame({'Training': train_metrics, 'Validation': val_metrics})
+        print(metrics_df.round(4))
+        
+        # Diagnose overfitting/underfitting
+        print(f"\n🔍 FIT DIAGNOSIS:")
+        
+        # Key metrics for diagnosis
+        mae_ratio = val_metrics['MAE'] / train_metrics['MAE'] if train_metrics['MAE'] != 0 else float('inf')
+        rmse_ratio = val_metrics['RMSE'] / train_metrics['RMSE'] if train_metrics['RMSE'] != 0 else float('inf')
+        r2_gap = train_metrics['R2'] - val_metrics['R2']
+        
+        # Overfitting detection
+        overfitting_threshold = 0.15  # 15% performance degradation
+        
+        if mae_ratio > 1 + overfitting_threshold and rmse_ratio > 1 + overfitting_threshold:
+            print("🚨 OVERFITTING DETECTED: Validation metrics are significantly worse than training")
+            print("   - Model is learning training data too well but not generalizing")
+            print("   - Consider: More regularization, simpler model, or more training data")
+        elif val_metrics['R2'] < 0.6 and train_metrics['R2'] < 0.6:
+            print("⚠️  UNDERFITTING DETECTED: Both training and validation R² are low")
+            print("   - Model is too simple to capture patterns in the data")
+            print("   - Consider: Increasing model complexity, more features, or longer training")
+        elif abs(r2_gap) < 0.1 and val_metrics['R2'] > 0.7:
+            print("✅ GOOD FIT: Model is generalizing well to validation data")
+        elif abs(r2_gap) < 0.15 and val_metrics['R2'] > 0.65:
+            print("📗 ACCEPTABLE FIT: Model shows reasonable generalization")
+        else:
+            print("🔍 MODEL NEEDS TUNING: Consider adjusting architecture or hyperparameters")
+        
+        print(f"   - MAE Ratio (Val/Train): {mae_ratio:.3f}")
+        print(f"   - RMSE Ratio (Val/Train): {rmse_ratio:.3f}")
+        print(f"   - R² Difference (Train-Val): {r2_gap:.3f}")
+        print(f"   - Validation MAPE: {val_metrics['MAPE']:.2f}%")
+    
+    def plot_training_history(self):
+        """Plot training history to visualize overfitting/underfitting"""
+        if self.train_history is None:
+            print("No training history available. Train the model first.")
+            return
+        
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Plot loss
+        ax1.plot(self.train_history['loss'], label='Training Loss', linewidth=2)
+        ax1.plot(self.train_history['val_loss'], label='Validation Loss', linewidth=2)
+        ax1.set_title('Model Loss (MSE) Over Epochs', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('Loss (MSE)')
+        ax1.set_xlabel('Epoch')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot MAE
+        ax2.plot(self.train_history['mae'], label='Training MAE', linewidth=2)
+        ax2.plot(self.train_history['val_mae'], label='Validation MAE', linewidth=2)
+        ax2.set_title('MAE Over Epochs', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('MAE')
+        ax2.set_xlabel('Epoch')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Plot predictions vs actual for last validation batch
+        val_predictions = self.model.predict(X_val)
+        actual_vals = y_val.flatten()
+        predicted_vals = val_predictions.flatten()
+        
+        ax3.scatter(actual_vals, predicted_vals, alpha=0.6)
+        ax3.plot([actual_vals.min(), actual_vals.max()], [actual_vals.min(), actual_vals.max()], 'r--', lw=2)
+        ax3.set_xlabel('Actual Values')
+        ax3.set_ylabel('Predicted Values')
+        ax3.set_title('Predicted vs Actual Values\n(Validation Set)', fontsize=14, fontweight='bold')
+        ax3.grid(True, alpha=0.3)
+        
+        # Plot error distribution
+        errors = predicted_vals - actual_vals
+        ax4.hist(errors, bins=50, alpha=0.7, edgecolor='black')
+        ax4.axvline(x=0, color='r', linestyle='--', linewidth=2)
+        ax4.set_xlabel('Prediction Error')
+        ax4.set_ylabel('Frequency')
+        ax4.set_title('Distribution of Prediction Errors', fontsize=14, fontweight='bold')
+        ax4.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print final metrics analysis
+        final_train_loss = self.train_history['loss'][-1]
+        final_val_loss = self.train_history['val_loss'][-1]
+        loss_ratio = final_val_loss / final_train_loss
+        
+        print(f"\n📈 FINAL EPOCH ANALYSIS:")
+        print(f"   Training Loss: {final_train_loss:.4f}")
+        print(f"   Validation Loss: {final_val_loss:.4f}")
+        print(f"   Loss Ratio (Val/Train): {loss_ratio:.3f}")
+        
+        if loss_ratio > 1.2:
+            print("   📊 Loss curve suggests: Potential overfitting (validation loss significantly higher)")
+        elif loss_ratio < 1.1:
+            print("   📊 Loss curve suggests: Model is generalizing well")
+        else:
+            print("   📊 Loss curve suggests: Acceptable performance with minor overfitting")
+
+    def predict_future(self, historical_df, future_features):
+        """Predict future cantine entries for deployment"""
+        # Prepare historical features
+        historical_processed, historical_target = self.prepare_features(historical_df)
+        
+        # Ensure future features have all required columns
+        missing_cols = set(self.feature_columns) - set(future_features.columns)
+        if missing_cols:
+            raise ValueError(f"Missing columns in future_features: {missing_cols}")
+        
+        # Combine historical and future features for processing
+        all_features = pd.concat([historical_processed, future_features[self.feature_columns]], ignore_index=True)
+        
+        # Scale features
+        all_features_scaled = self.feature_scaler.transform(all_features)
+        
+        # Get the most recent sequence
+        last_sequence = all_features_scaled[-self.sequence_length - len(future_features):-len(future_features)]
+        last_sequence = last_sequence.reshape(1, self.sequence_length, -1)
+        
+        # Make prediction
+        predictions_scaled = self.model.predict(last_sequence)
+        
+        # Inverse transform predictions
+        predictions = self.target_scaler.inverse_transform(
+            predictions_scaled.reshape(-1, 1)
+        ).flatten()
+        
+        return predictions
+
+# =============================================================================
+# DEPLOYMENT WORKFLOW
+# =============================================================================
+
+def weekly_deployment(historical_data, next_week_features, model_path=None):
+    """
+    Complete weekly deployment function to forecast next week's meal needs
+    
+    Parameters:
+    - historical_data: Complete historical DataFrame
+    - next_week_features: DataFrame with next week's known features
+    - model_path: Path to saved model (optional, will train if not provided)
+    """
+    
+    if model_path is None:
+        print("🔄 Training new model...")
+        forecaster = CantineForecaster(sequence_length=30, forecast_horizon=7)
+        forecaster.train(historical_data, epochs=100)
+        
+        # Save the trained model
+        model_path = "cantine_forecaster_model.h5"
+        forecaster.model.save(model_path)
+        print(f"💾 Model saved to {model_path}")
+    else:
+        print("🔄 Loading pre-trained model...")
+        forecaster = CantineForecaster(sequence_length=30, forecast_horizon=7)
+        forecaster.model = keras.models.load_model(model_path)
+        # Note: In production, you'd also need to save/load the scalers and feature columns
+    
+    # Make predictions
+    print("🔮 Making predictions for next week...")
+    predictions = forecaster.predict_future(historical_data, next_week_features)
+    
+    # Create results dataframe with recommendations
+    results = pd.DataFrame({
+        'date': pd.date_range(start=next_week_features['date'].iloc[0], periods=7),
+        'predicted_entries': predictions,
+        'recommended_meals': np.round(predictions * 1.05),  # Add 5% buffer
+        'confidence_level': 'high'  # Could be computed based on prediction variance
+    })
+    
+    # Summary statistics
+    total_meals = results['recommended_meals'].sum()
+    avg_daily = results['recommended_meals'].mean()
+    
+    print(f"\n🎯 DEPLOYMENT RESULTS:")
+    print(f"   Total meals needed for next week: {total_meals:.0f}")
+    print(f"   Average daily meals: {avg_daily:.0f}")
+    print(f"   Peak day: {results.loc[results['predicted_entries'].idxmax(), 'date'].strftime('%Y-%m-%d')}")
+    
+    return results, forecaster
+
+def prepare_future_features(start_date, weather_data, calendar_data):
+    """
+    Prepare future features for prediction based on available weather and calendar data
+    
+    Parameters:
+    - start_date: Starting date for the prediction period
+    - weather_data: DataFrame with future weather forecasts
+    - calendar_data: DataFrame with future calendar information (jeunes, holidays, etc.)
+    """
+    # This function would integrate with your weather API and calendar systems
+    # Returning a template structure
+    future_dates = pd.date_range(start=start_date, periods=7, freq='D')
+    
+    future_features = pd.DataFrame({
+        'date': future_dates,
+        'jour': future_dates.day,
+        'mois': future_dates.month,
+        'annee': future_dates.year,
+        # ... include all other features from your feature_columns
+        # These would come from your weather API and calendar data
+    })
+    
+    return future_features
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def main():
+    """Main execution function"""
+    print("🏭 CANTINE MEAL OPTIMIZATION SYSTEM")
+    print("="*50)
+    
+    # Load your data
+    # df = pd.read_csv('your_historical_data.csv')
+    # df['date'] = pd.to_datetime(df['date'])
+    
+    # For demonstration, we'll assume the data is loaded
+    print("📊 Data loading completed")
+    
+    # Example of how to use the system
+    # 1. Train and evaluate model
+    forecaster = CantineForecaster(sequence_length=30, forecast_horizon=7)
+    # history = forecaster.train(df, epochs=100)
+    # forecaster.plot_training_history()
+    
+    # 2. Weekly deployment example
+    # next_week_features = prepare_future_features(
+    #     start_date='2024-01-01',
+    #     weather_data=weather_forecast,
+    #     calendar_data=calendar_info
+    # )
+    # results, model = weekly_deployment(df, next_week_features)
+    
+    print("✅ System initialized and ready for deployment!")
+    return forecaster
+
+if __name__ == "__main__":
+    forecaster = main()
