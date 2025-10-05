@@ -1,0 +1,472 @@
+# ======================
+# 1. IMPORT LIBRARIES
+# ======================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+
+# Data preprocessing and feature engineering
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+
+# Machine Learning models
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from xgboost import XGBRegressor
+
+# Deep Learning models with TensorFlow/Keras
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, Conv1D, MaxPooling1D, Flatten
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.utils import to_categorical
+
+# Time series specific
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.tsa.stattools import adfuller
+import warnings
+warnings.filterwarnings('ignore')
+
+# ======================
+# 2. DATA LOADING & EXPLORATION
+# ======================
+# Load historical data
+df = pd.read_csv('data.csv', parse_dates=['date'])
+
+# Set date as index and sort
+df.set_index('date', inplace=True)
+df.sort_index(inplace=True)
+
+# Display basic info
+print("Dataset shape:", df.shape)
+print("\nFirst few rows:")
+print(df.head())
+print("\nDataset info:")
+print(df.info())
+print("\nMissing values:")
+print(df.isnull().sum())
+
+# ======================
+# 3. FEATURE ENGINEERING
+# ======================
+
+# Create cyclical features for temporal patterns
+def create_cyclical_features(df):
+    # Day of month cyclical (approx 30-day cycle)
+    df['jour_sin'] = np.sin(2 * np.pi * df['jour']/31)
+    df['jour_cos'] = np.cos(2 * np.pi * df['jour']/31)
+    
+    # Month cyclical (12-month cycle)
+    df['mois_sin'] = np.sin(2 * np.pi * df['mois']/12)
+    df['mois_cos'] = np.cos(2 * np.pi * df['mois']/12)
+    
+    # Day of week cyclical (7-day cycle) - converting jour_alpha to numerical
+    day_map = {'dimanche': 0, 'lundi': 1, 'mardi': 2, 'mercredi': 3, 
+               'jeudi': 4, 'vendredi': 5, 'samedi': 6}
+    df['day_of_week'] = df['jour_alpha'].map(day_map)
+    df['day_sin'] = np.sin(2 * np.pi * df['day_of_week']/7)
+    df['day_cos'] = np.cos(2 * np.pi * df['day_of_week']/7)
+    
+    return df
+
+# Create lagged features for time series patterns
+def create_lagged_features(df, target='nb_entrees_cantine', lags=[1, 2, 3, 7, 14, 30]):
+    for lag in lags:
+        df[f'{target}_lag_{lag}'] = df[target].shift(lag)
+    
+    # Rolling statistics
+    df['rolling_mean_7'] = df[target].shift(1).rolling(window=7).mean()
+    df['rolling_std_7'] = df[target].shift(1).rolling(window=7).std()
+    df['rolling_mean_30'] = df[target].shift(1).rolling(window=30).mean()
+    
+    return df
+
+# Create special event features
+def create_event_features(df):
+    # Combined school holiday effect
+    df['school_impact'] = df['conge_scolaires'] + df['BEM'] * 0.7 + df['BAC'] * 0.7
+    
+    # Weather impact score
+    df['weather_impact'] = (df['pluie'] * 0.6 + 
+                           df['fortement_nuageux'] * 0.3 + 
+                           df['nuageux'] * 0.1)
+    
+    # Seasonal impact
+    df['seasonal_impact'] = (df['hiver'] * 0.8 + 
+                            df['automne'] * 0.6 + 
+                            df['printemps'] * 0.4 + 
+                            df['ete'] * 0.2)
+    
+    return df
+
+# Apply all feature engineering
+print("Engineering features...")
+df = create_cyclical_features(df)
+df = create_lagged_features(df)
+df = create_event_features(df)
+
+# Drop original columns that have been encoded or are not useful
+columns_to_drop = ['jour_alpha', 'jour', 'mois', 'annee', 'hiver', 'printemps', 'ete', 'automne', 'day_of_week']
+df.drop(columns=[col for col in columns_to_drop if col in df.columns], inplace=True, errors='ignore')
+
+# Handle missing values from lag creation
+df.dropna(inplace=True)
+
+print(f"Shape after feature engineering: {df.shape}")
+print(f"Features after engineering: {list(df.columns)}")
+
+# ======================
+# 4. TRAIN-TEST SPLIT
+# ======================
+# Define features and target
+target = 'nb_entrees_cantine'
+
+# Remove future knowledge features - we won't have these for future prediction
+X = df.drop(columns=[target, 'nb_entrees_HO'])  # Remove HO entries as we won't have future values
+y = df[target]
+
+# Time-based split (last 20% for testing)
+split_index = int(len(df) * 0.8)
+X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
+y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+
+print(f"Training set: {X_train.shape}, Testing set: {X_test.shape}")
+
+# Scale features
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# For tree-based models, we can use unscaled data
+X_train_tree = X_train.copy()
+X_test_tree = X_test.copy()
+
+# ======================
+# 5. PREPARE DATA FOR DEEP LEARNING (3D TENSORS)
+# ======================
+def create_sequences(features, targets, sequence_length=30):
+    X_seq, y_seq = [], []
+    for i in range(sequence_length, len(features)):
+        X_seq.append(features[i-sequence_length:i])
+        y_seq.append(targets[i])
+    return np.array(X_seq), np.array(y_seq)
+
+# Create sequences for LSTM
+sequence_length = 30  # Use 30 days of history to predict next day
+X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train.values, sequence_length)
+X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test.values, sequence_length)
+
+print(f"LSTM training sequences: {X_train_seq.shape}, targets: {y_train_seq.shape}")
+print(f"LSTM testing sequences: {X_test_seq.shape}, targets: {y_test_seq.shape}")
+
+# ======================
+# 6. MODEL BUILDING
+# ======================
+
+# Dictionary to store model results
+model_results = {}
+
+## 6.1 Random Forest Regressor
+print("Training Random Forest...")
+rf_model = RandomForestRegressor(n_estimators=200, random_state=42, n_jobs=-1)
+rf_model.fit(X_train_tree, y_train)
+rf_pred = rf_model.predict(X_test_tree)
+
+## 6.2 XGBoost Regressor
+print("Training XGBoost...")
+xgb_model = XGBRegressor(n_estimators=200, learning_rate=0.1, random_state=42, n_jobs=-1)
+xgb_model.fit(X_train_tree, y_train)
+xgb_pred = xgb_model.predict(X_test_tree)
+
+## 6.3 LSTM Model
+print("Training LSTM...")
+lstm_model = Sequential([
+    Input(shape=(X_train_seq.shape[1], X_train_seq.shape[2])),
+    LSTM(100, return_sequences=True, dropout=0.2),
+    LSTM(50, dropout=0.2),
+    Dense(25, activation='relu'),
+    Dropout(0.2),
+    Dense(1)
+])
+
+lstm_model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+
+# Train LSTM
+history = lstm_model.fit(
+    X_train_seq, y_train_seq,
+    epochs=100,
+    batch_size=32,
+    validation_data=(X_test_seq, y_test_seq),
+    callbacks=[
+        EarlyStopping(patience=15, restore_best_weights=True),
+        ReduceLROnPlateau(patience=10, factor=0.5)
+    ],
+    verbose=0
+)
+
+lstm_pred = lstm_model.predict(X_test_seq).flatten()
+
+# Ensure LSTM predictions align with test set (due to sequence creation)
+y_test_lstm = y_test.iloc[sequence_length:]
+
+## 6.4 Hybrid CNN-LSTM Model
+print("Training CNN-LSTM...")
+cnn_lstm_model = Sequential([
+    Input(shape=(X_train_seq.shape[1], X_train_seq.shape[2])),
+    Conv1D(64, 3, activation='relu'),
+    MaxPooling1D(2),
+    Conv1D(32, 3, activation='relu'),
+    LSTM(50, dropout=0.2),
+    Dense(25, activation='relu'),
+    Dense(1)
+])
+
+cnn_lstm_model.compile(optimizer=Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+
+cnn_lstm_history = cnn_lstm_model.fit(
+    X_train_seq, y_train_seq,
+    epochs=80,
+    batch_size=32,
+    validation_data=(X_test_seq, y_test_seq),
+    callbacks=[EarlyStopping(patience=15, restore_best_weights=True)],
+    verbose=0
+)
+
+cnn_lstm_pred = cnn_lstm_model.predict(X_test_seq).flatten()
+
+# ======================
+# 7. MODEL EVALUATION
+# ======================
+def evaluate_model(y_true, y_pred, model_name):
+    """Calculate multiple evaluation metrics"""
+    mae = mean_absolute_error(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mape = mean_absolute_percentage_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    
+    # Calculate percentage within tolerance (within 10% of actual)
+    tolerance = 0.1
+    within_tolerance = np.mean(np.abs((y_true - y_pred) / y_true) <= tolerance)
+    
+    return {
+        'MAE': mae,
+        'RMSE': rmse, 
+        'MAPE': mape,
+        'R²': r2,
+        'Within_10%_Tolerance': within_tolerance
+    }
+
+# Evaluate all models
+print("\n" + "="*50)
+print("MODEL EVALUATION RESULTS")
+print("="*50)
+
+# Random Forest evaluation
+rf_metrics = evaluate_model(y_test, rf_pred, "Random Forest")
+model_results['Random Forest'] = rf_metrics
+
+# XGBoost evaluation  
+xgb_metrics = evaluate_model(y_test, xgb_pred, "XGBoost")
+model_results['XGBoost'] = xgb_metrics
+
+# LSTM evaluation (aligned with sequence data)
+lstm_metrics = evaluate_model(y_test_lstm, lstm_pred, "LSTM")
+model_results['LSTM'] = lstm_metrics
+
+# CNN-LSTM evaluation
+cnn_lstm_metrics = evaluate_model(y_test_lstm, cnn_lstm_pred, "CNN-LSTM")
+model_results['CNN-LSTM'] = cnn_lstm_metrics
+
+# Display results
+results_df = pd.DataFrame(model_results).T
+print("\nPerformance Metrics Comparison:")
+print(results_df.round(4))
+
+# ======================
+# 8. MODEL SELECTION & DEPLOYMENT PREPARATION
+# ======================
+
+# Select best model based on RMSE (you can change this criterion)
+best_model_name = results_df['RMSE'].idxmin()
+best_model_metrics = results_df.loc[best_model_name]
+
+print(f"\n{'='*50}")
+print(f"BEST MODEL: {best_model_name}")
+print(f"Performance: RMSE = {best_model_metrics['RMSE']:.2f}, MAE = {best_model_metrics['MAE']:.2f}")
+print(f"{'='*50}")
+
+# Save the best model and preprocessing objects
+import joblib
+
+if best_model_name == 'Random Forest':
+    best_model = rf_model
+elif best_model_name == 'XGBoost':
+    best_model = xgb_model
+elif best_model_name == 'LSTM':
+    best_model = lstm_model
+else:
+    best_model = cnn_lstm_model
+
+# Save model and preprocessing objects
+joblib.dump(best_model, 'best_meal_forecast_model.pkl')
+joblib.dump(scaler, 'feature_scaler.pkl')
+joblib.dump(X.columns, 'feature_columns.pkl')
+
+print("Best model and preprocessing objects saved!")
+
+# ======================
+# 9. DEPLOYMENT FOR FUTURE PREDICTIONS
+# ======================
+
+def prepare_future_data(future_df, historical_target_mean=400):
+    """
+    Prepare future data for prediction when we don't have:
+    - nb_entrees_HO (company entries)
+    - nb_entrees_cantine (cantine entries - our target)
+    - lagged features based on these
+    """
+    
+    # Create the same features as training
+    future_df = create_cyclical_features(future_df)
+    future_df = create_event_features(future_df)
+    
+    # We need to handle missing lagged features - use historical averages or other imputation
+    # Since we don't have historical target values, we'll use the historical mean
+    required_lag_columns = [col for col in X.columns if 'lag' in col or 'rolling' in col]
+    
+    for col in required_lag_columns:
+        if col not in future_df.columns:
+            if 'lag' in col:
+                # For lag features, use historical average
+                future_df[col] = historical_target_mean
+            elif 'rolling' in col:
+                # For rolling stats, use appropriate values
+                if 'mean' in col:
+                    future_df[col] = historical_target_mean
+                elif 'std' in col:
+                    future_df[col] = historical_target_mean * 0.1  # Assume 10% variation
+    
+    # Ensure all columns are in the same order as training
+    for col in X.columns:
+        if col not in future_df.columns:
+            future_df[col] = 0  # Default value for missing columns
+    
+    return future_df[X.columns]  # Return only the columns used in training
+
+def predict_next_week(future_data_path, model_path, scaler_path, feature_columns_path):
+    """
+    Make predictions for the next week using the saved model
+    """
+    # Load future data
+    future_df = pd.read_csv(future_data_path, parse_dates=['date'])
+    future_df.set_index('date', inplace=True)
+    
+    # Load model and preprocessing objects
+    model = joblib.load(model_path)
+    scaler = joblib.load(scaler_path)
+    feature_columns = joblib.load(feature_columns_path)
+    
+    # Prepare future data
+    future_processed = prepare_future_data(future_df)
+    
+    # Scale features
+    future_scaled = scaler.transform(future_processed)
+    
+    # Make predictions based on model type
+    if 'lstm' in model_path.lower() or isinstance(model, tf.keras.Model):
+        # For LSTM models, we need to create sequences
+        # Since we're predicting day-by-day for next week, we'll use a different approach
+        # This is simplified - in practice you might need a more sophisticated approach
+        predictions = model.predict(future_scaled.reshape(1, future_scaled.shape[0], future_scaled.shape[1])).flatten()
+    else:
+        # For tree-based models
+        predictions = model.predict(future_scaled)
+    
+    # Create results dataframe
+    results = pd.DataFrame({
+        'date': future_df.index,
+        'predicted_meals': predictions.round().astype(int),
+        'recommended_order': np.maximum(350, np.minimum(450, predictions.round().astype(int)))
+    })
+    
+    return results
+
+# Example usage for deployment (uncomment when ready)
+# print("\nGenerating predictions for next week...")
+# next_week_predictions = predict_next_week(
+#     'future_data.csv', 
+#     'best_meal_forecast_model.pkl',
+#     'feature_scaler.pkl', 
+#     'feature_columns.pkl'
+# )
+# print("Next week's meal predictions:")
+# print(next_week_predictions)
+
+# ======================
+# 10. VISUALIZATION
+# ======================
+plt.figure(figsize=(15, 10))
+
+# Plot 1: Actual vs Predicted for best model
+plt.subplot(2, 2, 1)
+if best_model_name in ['LSTM', 'CNN-LSTM']:
+    plt.plot(y_test_lstm.values, label='Actual', alpha=0.7)
+    if best_model_name == 'LSTM':
+        plt.plot(lstm_pred, label='Predicted', alpha=0.7)
+    else:
+        plt.plot(cnn_lstm_pred, label='Predicted', alpha=0.7)
+else:
+    plt.plot(y_test.values, label='Actual', alpha=0.7)
+    if best_model_name == 'Random Forest':
+        plt.plot(rf_pred, label='Predicted', alpha=0.7)
+    else:
+        plt.plot(xgb_pred, label='Predicted', alpha=0.7)
+plt.title(f'Actual vs Predicted - {best_model_name}')
+plt.legend()
+
+# Plot 2: Model comparison
+plt.subplot(2, 2, 2)
+results_df['RMSE'].plot(kind='bar')
+plt.title('Model Comparison (RMSE)')
+plt.xticks(rotation=45)
+
+# Plot 3: Error distribution
+plt.subplot(2, 2, 3)
+if best_model_name in ['LSTM', 'CNN-LSTM']:
+    errors = y_test_lstm.values - (lstm_pred if best_model_name == 'LSTM' else cnn_lstm_pred)
+else:
+    errors = y_test.values - (rf_pred if best_model_name == 'Random Forest' else xgb_pred)
+plt.hist(errors, bins=30, alpha=0.7)
+plt.title('Error Distribution')
+plt.xlabel('Prediction Error')
+
+# Plot 4: Feature importance (for tree-based models)
+plt.subplot(2, 2, 4)
+if best_model_name in ['Random Forest', 'XGBoost']:
+    if best_model_name == 'Random Forest':
+        importances = rf_model.feature_importances_
+    else:
+        importances = xgb_model.feature_importances_
+    
+    feature_imp_df = pd.DataFrame({
+        'feature': X.columns,
+        'importance': importances
+    }).sort_values('importance', ascending=True).tail(10)
+    
+    plt.barh(feature_imp_df['feature'], feature_imp_df['importance'])
+    plt.title('Top 10 Feature Importances')
+
+plt.tight_layout()
+plt.savefig('model_analysis.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+print("\nImplementation completed! Next steps:")
+print("1. Review the model performance metrics")
+print("2. Check the generated visualizations")
+print("3. Run the deployment function with your future_data.csv")
+print("4. Set up a weekly retraining schedule with new data")
