@@ -1,0 +1,239 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.svm import SVR
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.impute import SimpleImputer
+import warnings
+warnings.filterwarnings('ignore')
+
+# --- NEW IMPORTS FOR TIME SERIES MODELS ---
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from prophet import Prophet
+from sklearn.base import BaseEstimator, RegressorMixin
+
+# 1. Load and prepare the data (keep your existing preprocessing)
+df = pd.read_csv('data.csv')
+df['date'] = pd.to_datetime(df['date'])
+df = df.sort_values('date').reset_index(drop=True)
+
+day_mapping = {'dimanche': 0, 'lundi': 1, 'mardi': 2, 'mercredi': 3, 'jeudi': 4, 'vendredi': 5, 'samedi': 6}
+df['day_week'] = df['jour_alpha'].map(day_mapping)
+df = df.drop('jour_alpha', axis=1)
+
+# Feature engineering (keep your existing features)
+df['day_of_year'] = df['date'].dt.dayofyear
+df['week_of_year'] = df['date'].dt.isocalendar().week
+df['is_weekend'] = (df['day_week'] >= 5).astype(int)
+df['is_month_start'] = df['date'].dt.is_month_start.astype(int)
+df['is_month_end'] = df['date'].dt.is_month_end.astype(int)
+df['special_day'] = df['conge_scolaires'] + df['BEM'] + df['BAC']
+
+# Lag features and rolling statistics for nb_entrees_HO
+df['nb_entrees_HO_lag7'] = df['nb_entrees_HO'].shift(7)
+df['nb_entrees_HO_lag30'] = df['nb_entrees_HO'].shift(30)
+df['nb_entrees_HO_roll_mean7'] = df['nb_entrees_HO'].shift(1).rolling(window=7).mean()
+df['nb_entrees_HO_roll_mean30'] = df['nb_entrees_HO'].shift(1).rolling(window=30).mean()
+
+df_clean = df.dropna().copy()
+
+# 2. Define feature sets
+numerical_features = ['temperature', 'vitesse du vent', 'day_week', 'jour', 'mois', 'annee', 'day_of_year', 'week_of_year', 'nb_entrees_HO_lag7', 'nb_entrees_HO_lag30', 'nb_entrees_HO_roll_mean7', 'nb_entrees_HO_roll_mean30']
+categorical_features = ['conge_scolaires', 'jeunes', 'clair', 'nuageux', 'fortement nuageux', 'pluie', 'BEM', 'BAC', 'hiver', 'printemps', 'ete', 'automne', 'is_weekend', 'is_month_start', 'is_month_end', 'special_day']
+features = numerical_features + categorical_features
+
+X = df_clean[features]
+y_ho = df_clean['nb_entrees_HO']
+y_cantine = df_clean['nb_entrees_cantine']
+
+# Split data with time series consideration
+X_train, X_test, y_ho_train, y_ho_test = train_test_split(X, y_ho, test_size=0.2, shuffle=False, random_state=42)
+X_train_s2, X_test_s2, y_cantine_train, y_cantine_test = train_test_split(X, y_cantine, test_size=0.2, shuffle=False, random_state=42)
+
+# 3. Create Wrapper Classes for Time Series Models
+class ARIMAWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, order=(1,1,1)):
+        self.order = order
+        self.model = None
+        
+    def fit(self, X, y):
+        # For time series models, we primarily use the target 'y' and the date index
+        self.model = ARIMA(y, order=self.order)
+        self.model_fit = self.model.fit()
+        return self
+        
+    def predict(self, X):
+        return self.model_fit.forecast(steps=len(X))
+
+class SARIMAWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, order=(1,1,1), seasonal_order=(1,1,1,7)):
+        self.order = order
+        self.seasonal_order = seasonal_order
+        self.model = None
+        
+    def fit(self, X, y):
+        self.model = SARIMAX(y, order=self.order, seasonal_order=self.seasonal_order)
+        self.model_fit = self.model.fit(disp=False)
+        return self
+        
+    def predict(self, X):
+        return self.model_fit.forecast(steps=len(X))
+
+class ETSWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self, trend='add', seasonal='add', seasonal_periods=7):
+        self.trend = trend
+        self.seasonal = seasonal
+        self.seasonal_periods = seasonal_periods
+        self.model = None
+        
+    def fit(self, X, y):
+        self.model = ExponentialSmoothing(y, trend=self.trend, seasonal=self.seasonal, seasonal_periods=self.seasonal_periods)
+        self.model_fit = self.model.fit()
+        return self
+        
+    def predict(self, X):
+        return self.model_fit.forecast(len(X))
+
+class ProphetWrapper(BaseEstimator, RegressorMixin):
+    def __init__(self):
+        self.model = None
+        self.future_dates = None
+        
+    def fit(self, X, y):
+        # Prophet requires a DataFrame with 'ds' (date) and 'y' columns
+        prophet_df = pd.DataFrame({'ds': X.index, 'y': y})
+        self.model = Prophet()
+        self.model.fit(prophet_df)
+        return self
+        
+    def predict(self, X):
+        future = self.model.make_future_dataframe(periods=len(X), include_history=False)
+        forecast = self.model.predict(future)
+        return forecast['yhat'].values
+
+# 4. Update Model Dictionaries with New Models
+# First stage: Predicting nb_entrees_HO
+models_ho = {
+    'RandomForest': RandomForestRegressor(n_estimators=100, random_state=42),
+    'GradientBoosting': GradientBoostingRegressor(n_estimators=100, random_state=42),
+    'LinearRegression': LinearRegression(),
+    'SVR': SVR(kernel='rbf'),
+    'ARIMA': ARIMAWrapper(order=(1,1,1)),
+    'SARIMA': SARIMAWrapper(order=(1,1,1), seasonal_order=(1,1,1,7)),
+    'ETS': ETSWrapper(trend='add', seasonal='add', seasonal_periods=7),
+    'Prophet': ProphetWrapper()
+}
+
+# 5. Model Evaluation Function for Time Series (using your existing data split)
+def evaluate_timeseries_models(X_train, X_test, y_train, y_test, models_dict):
+    """
+    Evaluate models considering the temporal order of test data
+    """
+    model_scores = {}
+    
+    for name, model in models_dict.items():
+        try:
+            # Fit the model
+            model.fit(X_train, y_train)
+            
+            # Make predictions
+            y_pred = model.predict(X_test)
+            
+            # Calculate metrics
+            mae = mean_absolute_error(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            r2 = r2_score(y_test, y_pred)
+            
+            model_scores[name] = {
+                'MAE': mae,
+                'RMSE': rmse,
+                'R2': r2,
+                'model': model
+            }
+            print(f"{name}: MAE = {mae:.2f}, RMSE = {rmse:.2f}, R² = {r2:.4f}")
+            
+        except Exception as e:
+            print(f"Error with {name}: {str(e)}")
+            model_scores[name] = None
+    
+    return model_scores
+
+print("Evaluating models for nb_entrees_HO prediction...")
+ho_model_scores = evaluate_timeseries_models(X_train, X_test, y_ho_train, y_ho_test, models_ho)
+
+# 6. Select best model for nb_entrees_HO
+best_ho_model_name = min([k for k in ho_model_scores if ho_model_scores[k] is not None], 
+                        key=lambda x: ho_model_scores[x]['MAE'])
+best_ho_model = ho_model_scores[best_ho_model_name]['model']
+
+print(f"\nBest model for nb_entrees_HO: {best_ho_model_name}")
+
+# 7. Second stage: Predict nb_entrees_cantine using predicted nb_entrees_HO
+df_clean['predicted_nb_entrees_HO'] = best_ho_model.predict(X)
+
+# Update features for second stage
+features_stage2 = features + ['predicted_nb_entrees_HO']
+X_stage2 = df_clean[features_stage2]
+
+# Split for second stage
+X_train_s2, X_test_s2, y_cantine_train, y_cantine_test = train_test_split(
+    X_stage2, y_cantine, test_size=0.2, shuffle=False, random_state=42
+)
+
+# Use the same model dictionary for second stage or create a separate one
+print("\nEvaluating models for nb_entrees_cantine prediction...")
+cantine_model_scores = evaluate_timeseries_models(X_train_s2, X_test_s2, y_cantine_train, y_cantine_test, models_ho)
+
+# Select best model for nb_entrees_cantine
+best_cantine_model_name = min([k for k in cantine_model_scores if cantine_model_scores[k] is not None], 
+                             key=lambda x: cantine_model_scores[x]['MAE'])
+best_cantine_model = cantine_model_scores[best_cantine_model_name]['model']
+
+print(f"\nBest model for nb_entrees_cantine: {best_cantine_model_name}")
+
+# 8. Deployment function for future predictions
+def prepare_future_data(future_df, ho_model, cantine_model, feature_columns):
+    """
+    Prepare future data and generate predictions for both targets
+    """
+    # ... (keep your existing future data preparation logic)
+    # Then use the models for prediction
+    ho_predictions = ho_model.predict(future_df[feature_columns])
+    future_df['predicted_nb_entrees_HO'] = ho_predictions
+    
+    # Prepare for second stage
+    future_df_stage2 = future_df[feature_columns + ['predicted_nb_entrees_HO']]
+    
+    # Second stage prediction
+    cantine_predictions = cantine_model.predict(future_df_stage2)
+    future_df['predicted_nb_entrees_cantine'] = cantine_predictions
+    
+    # Calculate recommended meals
+    future_df['recommended_meals'] = future_df['predicted_nb_entrees_cantine'].round().astype(int)
+    future_df['recommended_meals'] = future_df['recommended_meals'].clip(50, 600)
+    
+    return future_df[['date', 'predicted_nb_entrees_HO', 'predicted_nb_entrees_cantine', 'recommended_meals']]
+
+# 9. Save the best models for weekly deployment
+import joblib
+
+model_artifacts = {
+    'ho_model': best_ho_model,
+    'cantine_model': best_cantine_model,
+    'features': features,
+    'feature_mapping': {
+        'numerical_features': numerical_features,
+        'categorical_features': categorical_features,
+        'day_mapping': day_mapping
+    }
+}
+
+joblib.dump(model_artifacts, 'enhanced_meal_prediction_models.pkl')
+print("\nEnhanced models saved for weekly deployment.")
