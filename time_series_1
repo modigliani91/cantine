@@ -1,0 +1,591 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Data preprocessing and feature engineering
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import TimeSeriesSplit, cross_val_score
+
+# Machine learning models
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+# Time series models
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from statsmodels.tsa.stattools import adfuller
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+
+# Prophet (if installed)
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except ImportError:
+    PROPHET_AVAILABLE = False
+    print("Prophet not installed. Install with: pip install prophet")
+
+
+
+df = pd.read_csv('your_actual_data.csv')
+
+print("Dataset shape:", df.shape)
+print("\nFirst few rows:")
+print(df.head())
+
+
+def engineer_features(df):
+    """Create comprehensive time-based features"""
+    df = df.copy()
+    
+    # Convert date to datetime and set as index
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+    
+    # Map jour_alpha to numerical day_week
+    day_mapping = {
+        'Monday': 1, 'Tuesday': 2, 'Wednesday': 3, 'Thursday': 4,
+        'Friday': 5, 'Saturday': 6, 'Sunday': 7,
+        'Lundi': 1, 'Mardi': 2, 'Mercredi': 3, 'Jeudi': 4,
+        'Vendredi': 5, 'Samedi': 6, 'Dimanche': 7
+    }
+    df['day_week'] = df['jour_alpha'].map(day_mapping)
+    
+    # Drop original jour_alpha
+    df = df.drop('jour_alpha', axis=1)
+    
+    # Additional time-based features
+    df['day_of_year'] = df['date'].dt.dayofyear
+    df['week_of_year'] = df['date'].dt.isocalendar().week
+    df['quarter'] = df['date'].dt.quarter
+    df['is_weekend'] = (df['day_week'] >= 6).astype(int)
+    df['is_month_start'] = df['date'].dt.is_month_start.astype(int)
+    df['is_month_end'] = df['date'].dt.is_month_end.astype(int)
+    
+    # Lag features for time series
+    for lag in [1, 7, 14, 30]:
+        df[f'nb_entrees_HO_lag_{lag}'] = df['nb_entrees_HO'].shift(lag)
+        df[f'nb_entrees_cantine_lag_{lag}'] = df['nb_entrees_cantine'].shift(lag)
+    
+    # Rolling statistics
+    for window in [7, 14, 30]:
+        df[f'nb_entrees_HO_rolling_mean_{window}'] = df['nb_entrees_HO'].rolling(window=window, min_periods=1).mean()
+        df[f'nb_entrees_HO_rolling_std_{window}'] = df['nb_entrees_HO'].rolling(window=window, min_periods=1).std()
+    
+    # Fill NaN values created by lag features
+    df = df.fillna(method='bfill').fillna(method='ffill')
+    
+    return df
+
+# Apply feature engineering
+df_engineered = engineer_features(df)
+print("Engineered features shape:", df_engineered.shape)
+print("\nEngineered features columns:")
+print(df_engineered.columns.tolist())
+
+def create_visualizations(df):
+    """Create comprehensive visualizations of the data"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Time series of both targets
+    axes[0, 0].plot(df['date'], df['nb_entrees_HO'], label='Employee Entries', alpha=0.7)
+    axes[0, 0].plot(df['date'], df['nb_entrees_cantine'], label='Cafeteria Entries', alpha=0.7)
+    axes[0, 0].set_title('Time Series of Employee and Cafeteria Entries')
+    axes[0, 0].set_xlabel('Date')
+    axes[0, 0].set_ylabel('Number of Entries')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Distribution of entries
+    axes[0, 1].hist(df['nb_entrees_HO'], bins=30, alpha=0.7, label='Employee Entries', density=True)
+    axes[0, 1].hist(df['nb_entrees_cantine'], bins=30, alpha=0.7, label='Cafeteria Entries', density=True)
+    axes[0, 1].set_title('Distribution of Entries')
+    axes[0, 1].set_xlabel('Number of Entries')
+    axes[0, 1].set_ylabel('Density')
+    axes[0, 1].legend()
+    
+    # Weekly pattern
+    weekly_avg = df.groupby('day_week')[['nb_entrees_HO', 'nb_entrees_cantine']].mean()
+    axes[1, 0].plot(weekly_avg.index, weekly_avg['nb_entrees_HO'], marker='o', label='Employee Entries')
+    axes[1, 0].plot(weekly_avg.index, weekly_avg['nb_entrees_cantine'], marker='s', label='Cafeteria Entries')
+    axes[1, 0].set_title('Average Entries by Day of Week')
+    axes[1, 0].set_xlabel('Day of Week (1=Monday)')
+    axes[1, 0].set_ylabel('Average Entries')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Monthly pattern
+    monthly_avg = df.groupby('mois')[['nb_entrees_HO', 'nb_entrees_cantine']].mean()
+    axes[1, 1].plot(monthly_avg.index, monthly_avg['nb_entrees_HO'], marker='o', label='Employee Entries')
+    axes[1, 1].plot(monthly_avg.index, monthly_avg['nb_entrees_cantine'], marker='s', label='Cafeteria Entries')
+    axes[1, 1].set_title('Average Entries by Month')
+    axes[1, 1].set_xlabel('Month')
+    axes[1, 1].set_ylabel('Average Entries')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+create_visualizations(df_engineered)
+
+
+class ModelEvaluator:
+    """Evaluate models for overfitting/underfitting and performance"""
+    
+    def __init__(self, models, feature_columns, target_column):
+        self.models = models
+        self.feature_columns = feature_columns
+        self.target_column = target_column
+        self.results = {}
+        self.tscv = TimeSeriesSplit(n_splits=5)
+    
+    def evaluate_model(self, model, X, y, model_name):
+        """Evaluate a single model"""
+        # Time series cross-validation
+        cv_scores = cross_val_score(model, X, y, cv=self.tscv, 
+                                  scoring='neg_mean_absolute_error')
+        cv_mae = -cv_scores.mean()
+        
+        # Train-test split (80-20)
+        split_point = int(0.8 * len(X))
+        X_train, X_test = X[:split_point], X[split_point:]
+        y_train, y_test = y[:split_point], y[split_point:]
+        
+        # Fit model
+        if hasattr(model, 'fit'):
+            model.fit(X_train, y_train)
+            y_train_pred = model.predict(X_train)
+            y_test_pred = model.predict(X_test)
+        else:
+            # For statsmodels types
+            model_fit = model.fit()
+            y_train_pred = model_fit.predict()
+            y_test_pred = model_fit.forecast(len(y_test))
+        
+        # Calculate metrics
+        train_mae = mean_absolute_error(y_train, y_train_pred)
+        test_mae = mean_absolute_error(y_test, y_test_pred)
+        train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+        test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+        train_r2 = r2_score(y_train, y_train_pred)
+        test_r2 = r2_score(y_test, y_test_pred)
+        
+        # Detect overfitting/underfitting
+        overfitting_gap = train_mae - test_mae
+        if overfitting_gap < -0.1 * train_mae:  # Train much better than test
+            fit_status = "Overfitting"
+        elif train_mae > 0.15 * y_train.mean():  # High training error
+            fit_status = "Underfitting"
+        else:
+            fit_status = "Good Fit"
+        
+        return {
+            'cv_mae': cv_mae,
+            'train_mae': train_mae,
+            'test_mae': test_mae,
+            'train_rmse': train_rmse,
+            'test_rmse': test_rmse,
+            'train_r2': train_r2,
+            'test_r2': test_r2,
+            'fit_status': fit_status,
+            'model': model,
+            'predictions': (y_train_pred, y_test_pred)
+        }
+    
+    def evaluate_all_models(self, X, y):
+        """Evaluate all models"""
+        for model_name, model in self.models.items():
+            print(f"Evaluating {model_name}...")
+            try:
+                self.results[model_name] = self.evaluate_model(model, X, y, model_name)
+            except Exception as e:
+                print(f"Error evaluating {model_name}: {e}")
+                self.results[model_name] = None
+    
+    def get_best_model(self):
+        """Get the best model based on test MAE"""
+        valid_results = {k: v for k, v in self.results.items() if v is not None}
+        if not valid_results:
+            return None
+        best_model_name = min(valid_results.keys(), 
+                            key=lambda x: valid_results[x]['test_mae'])
+        return best_model_name, valid_results[best_model_name]
+    
+    def plot_comparison(self):
+        """Plot model comparison"""
+        valid_results = {k: v for k, v in self.results.items() if v is not None}
+        if not valid_results:
+            return
+        
+        models = list(valid_results.keys())
+        test_maes = [valid_results[m]['test_mae'] for m in models]
+        train_maes = [valid_results[m]['train_mae'] for m in models]
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
+        x = np.arange(len(models))
+        width = 0.35
+        
+        ax.bar(x - width/2, train_maes, width, label='Train MAE', alpha=0.7)
+        ax.bar(x + width/2, test_maes, width, label='Test MAE', alpha=0.7)
+        
+        ax.set_xlabel('Models')
+        ax.set_ylabel('Mean Absolute Error')
+        ax.set_title('Model Comparison: Train vs Test MAE')
+        ax.set_xticks(x)
+        ax.set_xticklabels(models, rotation=45)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Add fit status annotations
+        for i, model in enumerate(models):
+            status = valid_results[model]['fit_status']
+            ax.text(i, max(test_maes[i], train_maes[i]) * 1.05, 
+                   status, ha='center', va='bottom', fontweight='bold',
+                   color='red' if status != "Good Fit" else 'green')
+        
+        plt.tight_layout()
+        plt.show()
+
+
+def prepare_nb_entrees_HO_data(df):
+    """Prepare data for nb_entrees_HO prediction"""
+    # Features to exclude for first step
+    exclude_cols = ['nb_entrees_cantine']
+    feature_cols = [col for col in df.columns if col not in 
+                   ['date', 'nb_entrees_HO', 'nb_entrees_cantine']]
+    
+    X = df[feature_cols]
+    y = df['nb_entrees_HO']
+    
+    return X, y, feature_cols
+
+# Prepare data for first step
+X_ho, y_ho, feature_cols_ho = prepare_nb_entrees_HO_data(df_engineered)
+
+# Define preprocessing
+numeric_features = ['temperature', 'vitesse du vent', 'day_of_year', 'week_of_year', 
+                   'quarter'] + [col for col in X_ho.columns if 'lag' in col or 'rolling' in col]
+categorical_features = [col for col in X_ho.columns if col not in numeric_features and 
+                       col not in ['date', 'nb_entrees_HO', 'nb_entrees_cantine']]
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numeric_features),
+        ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_features)
+    ])
+
+# Define models for nb_entrees_HO
+models_ho = {
+    'RandomForest': Pipeline([
+        ('preprocessor', preprocessor),
+        ('regressor', RandomForestRegressor(n_estimators=100, random_state=42))
+    ]),
+    'GradientBoosting': Pipeline([
+        ('preprocessor', preprocessor),
+        ('regressor', GradientBoostingRegressor(n_estimators=100, random_state=42))
+    ]),
+    'LinearRegression': Pipeline([
+        ('preprocessor', preprocessor),
+        ('regressor', LinearRegression())
+    ])
+}
+
+# Add time series models
+def create_arima_model(y):
+    return ARIMA(y, order=(1, 1, 1))
+
+def create_sarima_model(y):
+    return SARIMAX(y, order=(1, 1, 1), seasonal_order=(1, 1, 1, 7))
+
+models_ho['ARIMA'] = create_arima_model
+models_ho['SARIMA'] = create_sarima_model
+
+# Evaluate all models for nb_entrees_HO
+print("Step 1: Evaluating models for nb_entrees_HO prediction...")
+evaluator_ho = ModelEvaluator(models_ho, feature_cols_ho, 'nb_entrees_HO')
+evaluator_ho.evaluate_all_models(X_ho, y_ho)
+
+# Get best model
+best_ho_name, best_ho_result = evaluator_ho.get_best_model()
+print(f"\nBest model for nb_entrees_HO: {best_ho_name}")
+print(f"Test MAE: {best_ho_result['test_mae']:.2f}")
+print(f"Fit Status: {best_ho_result['fit_status']}")
+
+# Plot comparison
+evaluator_ho.plot_comparison()
+
+
+def prepare_nb_entrees_cantine_data(df, ho_predictions=None):
+    """Prepare data for nb_entrees_cantine prediction"""
+    # Include nb_entrees_HO as a feature for second step
+    feature_cols = [col for col in df.columns if col not in 
+                   ['date', 'nb_entrees_cantine']]
+    
+    X = df[feature_cols]
+    y = df['nb_entrees_cantine']
+    
+    # If we have HO predictions (for future dates), use them
+    if ho_predictions is not None:
+        X = X.copy()
+        if 'nb_entrees_HO' in X.columns:
+            # For future predictions, we might not have actual HO values
+            pass
+    
+    return X, y, feature_cols
+
+# Prepare data for second step
+X_cantine, y_cantine, feature_cols_cantine = prepare_nb_entrees_cantine_data(df_engineered)
+
+# Update preprocessor for cantine data (includes nb_entrees_HO)
+numeric_features_cantine = numeric_features + ['nb_entrees_HO']
+categorical_features_cantine = [col for col in categorical_features if col != 'nb_entrees_HO']
+
+preprocessor_cantine = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numeric_features_cantine),
+        ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_features_cantine)
+    ])
+
+# Define models for nb_entrees_cantine
+models_cantine = {
+    'RandomForest': Pipeline([
+        ('preprocessor', preprocessor_cantine),
+        ('regressor', RandomForestRegressor(n_estimators=100, random_state=42))
+    ]),
+    'GradientBoosting': Pipeline([
+        ('preprocessor', preprocessor_cantine),
+        ('regressor', GradientBoostingRegressor(n_estimators=100, random_state=42))
+    ]),
+    'LinearRegression': Pipeline([
+        ('preprocessor', preprocessor_cantine),
+        ('regressor', LinearRegression())
+    ])
+}
+
+# Evaluate all models for nb_entrees_cantine
+print("\nStep 2: Evaluating models for nb_entrees_cantine prediction...")
+evaluator_cantine = ModelEvaluator(models_cantine, feature_cols_cantine, 'nb_entrees_cantine')
+evaluator_cantine.evaluate_all_models(X_cantine, y_cantine)
+
+# Get best model
+best_cantine_name, best_cantine_result = evaluator_cantine.get_best_model()
+print(f"\nBest model for nb_entrees_cantine: {best_cantine_name}")
+print(f"Test MAE: {best_cantine_result['test_mae']:.2f}")
+print(f"Fit Status: {best_cantine_result['fit_status']}")
+
+# Plot comparison
+evaluator_cantine.plot_comparison()
+
+
+class CantineForecastingPipeline:
+    """Complete pipeline for cafeteria forecasting"""
+    
+    def __init__(self, best_ho_model, best_cantine_model, feature_columns_ho, feature_columns_cantine):
+        self.best_ho_model = best_ho_model
+        self.best_cantine_model = best_cantine_model
+        self.feature_columns_ho = feature_columns_ho
+        self.feature_columns_cantine = feature_columns_cantine
+        self.scaler = StandardScaler()
+        self.ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+    
+    def create_future_dates_dataframe(self, start_date, end_date):
+        """Create dataframe with future dates and engineered features"""
+        dates = pd.date_range(start_date, end_date, freq='D')
+        
+        # Base dataframe with dates
+        future_df = pd.DataFrame({'date': dates})
+        
+        # Add basic date features
+        future_df['jour'] = future_df['date'].dt.day
+        future_df['mois'] = future_df['date'].dt.month
+        future_df['annee'] = future_df['date'].dt.year
+        future_df['jour_alpha'] = future_df['date'].dt.strftime('%A')
+        
+        # Map to numerical day_week
+        day_mapping = {
+            'Monday': 1, 'Tuesday': 2, 'Wednesday': 3, 'Thursday': 4,
+            'Friday': 5, 'Saturday': 6, 'Sunday': 7
+        }
+        future_df['day_week'] = future_df['jour_alpha'].map(day_mapping)
+        future_df = future_df.drop('jour_alpha', axis=1)
+        
+        # Add additional time features (same as in engineer_features)
+        future_df['day_of_year'] = future_df['date'].dt.dayofyear
+        future_df['week_of_year'] = future_df['date'].dt.isocalendar().week
+        future_df['quarter'] = future_df['date'].dt.quarter
+        future_df['is_weekend'] = (future_df['day_week'] >= 6).astype(int)
+        future_df['is_month_start'] = future_df['date'].dt.is_month_start.astype(int)
+        future_df['is_month_end'] = future_df['date'].dt.is_month_end.astype(int)
+        
+        # Add seasonal dummy variables
+        future_df['hiver'] = (future_df['mois'].isin([12, 1, 2])).astype(int)
+        future_df['printemps'] = (future_df['mois'].isin([3, 4, 5])).astype(int)
+        future_df['ete'] = (future_df['mois'].isin([6, 7, 8])).astype(int)
+        future_df['automne'] = (future_df['mois'].isin([9, 10, 11])).astype(int)
+        
+        # TODO: Add realistic values for other features based on historical patterns
+        # For demonstration, using random values - replace with actual business logic
+        np.random.seed(42)  # For reproducibility
+        
+        future_df['conge_scolaires'] = 0  # Update based on actual school calendar
+        future_df['jeune_tres_probable'] = 0  # Update based on religious calendar
+        future_df['jeune_probable'] = 0  # Update based on religious calendar
+        future_df['temperature'] = np.random.normal(25, 5, len(future_df))
+        future_df['vitesse du vent'] = np.random.gamma(2, 2, len(future_df))
+        
+        # Weather conditions (mutually exclusive)
+        weather_conditions = ['clair', 'nuageux', 'fortement nuageux', 'pluie']
+        for condition in weather_conditions:
+            future_df[condition] = 0
+        
+        # Simple weather assignment (refine with seasonal patterns)
+        future_df['clair'] = (np.random.random(len(future_df)) > 0.6).astype(int)
+        future_df['nuageux'] = ((future_df['clair'] == 0) & (np.random.random(len(future_df)) > 0.5)).astype(int)
+        future_df['pluie'] = ((future_df['clair'] == 0) & (future_df['nuageux'] == 0)).astype(int)
+        
+        future_df['BEM'] = 0  # Update based on exam calendar
+        future_df['BAC'] = 0  # Update based on exam calendar
+        
+        # Initialize lag features with reasonable values
+        # In practice, you might use the last known values from historical data
+        for lag in [1, 7, 14, 30]:
+            future_df[f'nb_entrees_HO_lag_{lag}'] = 350  # Average value
+            future_df[f'nb_entrees_cantine_lag_{lag}'] = 320  # Average value
+        
+        for window in [7, 14, 30]:
+            future_df[f'nb_entrees_HO_rolling_mean_{window}'] = 350
+            future_df[f'nb_entrees_HO_rolling_std_{window}'] = 50
+        
+        return future_df
+    
+    def predict_future(self, start_date, end_date, historical_df):
+        """Generate predictions for future dates"""
+        # Create future dataframe
+        future_df = self.create_future_dates_dataframe(start_date, end_date)
+        
+        # Ensure all required columns are present
+        for col in self.feature_columns_ho:
+            if col not in future_df.columns:
+                future_df[col] = 0  # Default value for missing columns
+        
+        # Reorder columns to match training data
+        future_features_ho = future_df[self.feature_columns_ho]
+        
+        # Step 1: Predict nb_entrees_HO
+        print("Predicting nb_entrees_HO...")
+        if hasattr(self.best_ho_model, 'predict'):
+            nb_entrees_HO_pred = self.best_ho_model.predict(future_features_ho)
+        else:
+            # For time series models, we need a different approach
+            model_fit = self.best_ho_model.fit()
+            nb_entrees_HO_pred = model_fit.forecast(len(future_df))
+        
+        future_df['nb_entrees_HO_pred'] = nb_entrees_HO_pred
+        
+        # Step 2: Predict nb_entrees_cantine using HO predictions
+        print("Predicting nb_entrees_cantine...")
+        # Update features to include HO predictions
+        future_features_cantine = future_df[self.feature_columns_cantine]
+        if 'nb_entrees_HO' in future_features_cantine.columns:
+            future_features_cantine['nb_entrees_HO'] = nb_entrees_HO_pred
+        
+        if hasattr(self.best_cantine_model, 'predict'):
+            nb_entrees_cantine_pred = self.best_cantine_model.predict(future_features_cantine)
+        else:
+            model_fit = self.best_cantine_model.fit()
+            nb_entrees_cantine_pred = model_fit.forecast(len(future_df))
+        
+        future_df['nb_entrees_cantine_pred'] = nb_entrees_cantine_pred
+        
+        return future_df[['date', 'nb_entrees_HO_pred', 'nb_entrees_cantine_pred']]
+
+# Create and run the deployment pipeline
+print("\nCreating deployment pipeline...")
+
+# Get the best models from evaluation
+best_ho_model = evaluator_ho.results[best_ho_name]['model']
+best_cantine_model = evaluator_cantine.results[best_cantine_name]['model']
+
+# Create pipeline
+pipeline = CantineForecastingPipeline(
+    best_ho_model=best_ho_model,
+    best_cantine_model=best_cantine_model,
+    feature_columns_ho=feature_cols_ho,
+    feature_columns_cantine=feature_cols_cantine
+)
+
+# Generate predictions for the required period
+print("Generating predictions for 2024-09-29 to 2024-12-31...")
+future_predictions = pipeline.predict_future(
+    start_date='2024-09-29',
+    end_date='2024-12-31',
+    historical_df=df_engineered
+)
+
+print("Future predictions generated successfully!")
+print(future_predictions.head(10))
+
+
+# Create final CSV output
+final_output = future_predictions.rename(columns={
+    'nb_entrees_HO_pred': 'nb_entrees_HO',
+    'nb_entrees_cantine_pred': 'nb_entrees_cantine'
+})
+
+# Save to CSV
+final_output.to_csv('cantine_predictions_2024.csv', index=False)
+print("Predictions saved to 'cantine_predictions_2024.csv'")
+
+# Final visualization
+fig, axes = plt.subplots(2, 1, figsize=(15, 10))
+
+# Plot historical data and predictions
+historical_dates = df_engineered['date']
+future_dates = future_predictions['date']
+
+# Employee entries
+axes[0].plot(historical_dates, df_engineered['nb_entrees_HO'], 
+            label='Historical Employee Entries', alpha=0.7, color='blue')
+axes[0].plot(future_dates, future_predictions['nb_entrees_HO_pred'], 
+            label='Predicted Employee Entries', linestyle='--', color='red')
+axes[0].axvline(x=pd.Timestamp('2024-09-26'), color='gray', linestyle=':', 
+               label='Prediction Start')
+axes[0].set_title('Employee Entries: Historical vs Predicted')
+axes[0].set_xlabel('Date')
+axes[0].set_ylabel('Number of Entries')
+axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+# Cafeteria entries
+axes[1].plot(historical_dates, df_engineered['nb_entrees_cantine'], 
+            label='Historical Cafeteria Entries', alpha=0.7, color='green')
+axes[1].plot(future_dates, future_predictions['nb_entrees_cantine_pred'], 
+            label='Predicted Cafeteria Entries', linestyle='--', color='orange')
+axes[1].axvline(x=pd.Timestamp('2024-09-26'), color='gray', linestyle=':', 
+               label='Prediction Start')
+axes[1].set_title('Cafeteria Entries: Historical vs Predicted')
+axes[1].set_xlabel('Date')
+axes[1].set_ylabel('Number of Entries')
+axes[1].legend()
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Summary statistics
+print("\nPrediction Summary (2024-09-29 to 2024-12-31):")
+print(f"Average predicted employee entries: {future_predictions['nb_entrees_HO_pred'].mean():.1f}")
+print(f"Average predicted cafeteria entries: {future_predictions['nb_entrees_cantine_pred'].mean():.1f}")
+print(f"Days with cafeteria entries > 400: {(future_predictions['nb_entrees_cantine_pred'] > 400).sum()}")
+print(f"Days with cafeteria entries < 300: {(future_predictions['nb_entrees_cantine_pred'] < 300).sum()}")
+
+print("\nImplementation completed successfully!")
+print("All libraries imported successfully!")
