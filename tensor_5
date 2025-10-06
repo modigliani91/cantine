@@ -1,0 +1,438 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.impute import SimpleImputer
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import joblib
+import warnings
+warnings.filterwarnings('ignore')
+
+# Load and prepare data
+def load_and_prepare_data(filename):
+    """Load and preprocess the historical data"""
+    data = pd.read_csv(filename)
+    
+    # Convert date column to datetime and extract features
+    data['date'] = pd.to_datetime(data['date'])
+    
+    # Create additional temporal features that might be predictive
+    data['week_of_year'] = data['date'].dt.isocalendar().week
+    data['is_weekend'] = (data['jour_alpha'].isin(['Samedi', 'Dimanche'])).astype(int)
+    data['is_month_start'] = data['date'].dt.is_month_start.astype(int)
+    data['is_month_end'] = data['date'].dt.is_month_end.astype(int)
+    
+    return data
+
+# Load the data
+data = load_and_prepare_data('data.csv')
+
+# Define features for the models
+feature_columns = [
+    'jour', 'mois', 'annee', 'jour_alpha', 'hijri_day', 
+    'conge_scolaires', 'jeunes', 'temperature', 'vitesse du vent',
+    'clair', 'nuageux', 'fortement nuageux', 'pluie', 'BEM', 'BAC',
+    'hiver', 'printemps', 'ete', 'automne', 'week_of_year', 
+    'is_weekend', 'is_month_start', 'is_month_end'
+]
+
+# Separate features and targets
+X = data[feature_columns]
+y_ho = data['nb_entrees_HO']
+y_cantine = data['nb_entrees_cantine']
+
+# Split data into training and testing sets
+X_train, X_test, y_ho_train, y_ho_test = train_test_split(
+    X, y_ho, test_size=0.2, random_state=42, shuffle=False
+)
+
+X_train, X_test, y_cantine_train, y_cantine_test = train_test_split(
+    X, y_cantine, test_size=0.2, random_state=42, shuffle=False
+)
+
+# Define preprocessing for numerical and categorical features
+numerical_features = ['jour', 'mois', 'annee', 'hijri_day', 'temperature', 
+                     'vitesse du vent', 'week_of_year']
+categorical_features = ['jour_alpha', 'conge_scolaires', 'jeunes', 'clair', 
+                       'nuageux', 'fortement nuageux', 'pluie', 'BEM', 'BAC',
+                       'hiver', 'printemps', 'ete', 'automne', 'is_weekend',
+                       'is_month_start', 'is_month_end']
+
+# Create preprocessors
+numerical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='most_frequent')),
+    ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+])
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', numerical_transformer, numerical_features),
+        ('cat', categorical_transformer, categorical_features)
+    ]
+)
+
+# Model 1: Traditional Machine Learning Models for nb_entrees_HO
+print("Training models for nb_entrees_HO prediction...")
+
+# Define models
+models_ho = {
+    'Random Forest': RandomForestRegressor(n_estimators=200, random_state=42),
+    'Gradient Boosting': GradientBoostingRegressor(n_estimators=200, random_state=42),
+    'Linear Regression': LinearRegression()
+}
+
+# Train and evaluate models for nb_entrees_HO
+ho_results = {}
+ho_predictions = {}
+
+for name, model in models_ho.items():
+    # Create pipeline
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor),
+        ('regressor', model)
+    ])
+    
+    # Train model
+    pipeline.fit(X_train, y_ho_train)
+    
+    # Make predictions
+    y_pred = pipeline.predict(X_test)
+    
+    # Calculate metrics
+    mae = mean_absolute_error(y_ho_test, y_pred)
+    mse = mean_squared_error(y_ho_test, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_ho_test, y_pred)
+    
+    ho_results[name] = {
+        'model': pipeline,
+        'mae': mae,
+        'mse': mse, 
+        'rmse': rmse,
+        'r2': r2,
+        'predictions': y_pred
+    }
+    
+    ho_predictions[name] = y_pred
+    
+    print(f"{name} - MAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.4f}")
+
+# Model 2: Neural Network for nb_entrees_HO
+print("\nTraining Neural Network for nb_entrees_HO...")
+
+# Create and preprocess data for neural network
+preprocessor.fit(X_train)
+X_train_processed = preprocessor.transform(X_train)
+X_test_processed = preprocessor.transform(X_test)
+
+# Get feature dimension after preprocessing
+feature_dim = X_train_processed.shape[1]
+
+# Build neural network model
+nn_model_ho = Sequential([
+    Dense(128, activation='relu', input_shape=(feature_dim,)),
+    BatchNormalization(),
+    Dropout(0.3),
+    Dense(64, activation='relu'),
+    BatchNormalization(), 
+    Dropout(0.3),
+    Dense(32, activation='relu'),
+    Dropout(0.2),
+    Dense(1, activation='linear')
+])
+
+# Compile model
+nn_model_ho.compile(
+    optimizer=Adam(learning_rate=0.001),
+    loss='mse',
+    metrics=['mae']
+)
+
+# Train model
+history_ho = nn_model_ho.fit(
+    X_train_processed, y_ho_train,
+    epochs=100,
+    batch_size=32,
+    validation_split=0.2,
+    callbacks=[
+        EarlyStopping(patience=15, restore_best_weights=True),
+        ReduceLROnPlateau(factor=0.5, patience=10)
+    ],
+    verbose=0
+)
+
+# Evaluate neural network
+nn_pred_ho = nn_model_ho.predict(X_test_processed).flatten()
+
+nn_mae_ho = mean_absolute_error(y_ho_test, nn_pred_ho)
+nn_rmse_ho = np.sqrt(mean_squared_error(y_ho_test, nn_pred_ho))
+nn_r2_ho = r2_score(y_ho_test, nn_pred_ho)
+
+ho_results['Neural Network'] = {
+    'model': nn_model_ho,
+    'preprocessor': preprocessor,
+    'mae': nn_mae_ho,
+    'rmse': nn_rmse_ho, 
+    'r2': nn_r2_ho,
+    'predictions': nn_pred_ho
+}
+
+print(f"Neural Network - MAE: {nn_mae_ho:.2f}, RMSE: {nn_rmse_ho:.2f}, R²: {nn_r2_ho:.4f}")
+
+# Select best model for nb_entrees_HO based on MAE
+best_ho_model_name = min(ho_results.items(), key=lambda x: x[1]['mae'])[0]
+best_ho_model = ho_results[best_ho_model_name]
+print(f"\nBest model for nb_entrees_HO: {best_ho_model_name} with MAE: {best_ho_model['mae']:.2f}")
+
+# Model 3: Predict nb_entrees_cantine using predicted nb_entrees_HO
+print("\nTraining models for nb_entrees_cantine prediction...")
+
+# Add predicted HO entries as feature for cantine prediction
+X_train_with_ho = X_train.copy()
+X_test_with_ho = X_test.copy()
+
+# Use predictions from the best HO model
+best_ho_pred_train = ho_results[best_ho_model_name]['model'].predict(X_train)
+best_ho_pred_test = ho_results[best_ho_model_name]['model'].predict(X_test)
+
+X_train_with_ho['predicted_ho'] = best_ho_pred_train
+X_test_with_ho['predicted_ho'] = best_ho_pred_test
+
+# Update feature list to include predicted HO entries
+feature_columns_cantine = feature_columns + ['predicted_ho']
+
+# Update preprocessor for cantine prediction
+categorical_features_cantine = categorical_features.copy()
+# 'predicted_ho' is numerical, so we don't add it to categorical features
+
+preprocessor_cantine = ColumnTransformer(
+    transformers=[
+        ('num', numerical_transformer, numerical_features + ['predicted_ho']),
+        ('cat', categorical_transformer, categorical_features)
+    ]
+)
+
+# Train models for nb_entrees_cantine
+models_cantine = {
+    'Random Forest': RandomForestRegressor(n_estimators=200, random_state=42),
+    'Gradient Boosting': GradientBoostingRegressor(n_estimators=200, random_state=42)
+}
+
+cantine_results = {}
+
+for name, model in models_cantine.items():
+    pipeline = Pipeline(steps=[
+        ('preprocessor', preprocessor_cantine),
+        ('regressor', model)
+    ])
+    
+    pipeline.fit(X_train_with_ho, y_cantine_train)
+    y_pred = pipeline.predict(X_test_with_ho)
+    
+    mae = mean_absolute_error(y_cantine_test, y_pred)
+    mse = mean_squared_error(y_cantine_test, y_pred)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(y_cantine_test, y_pred)
+    
+    cantine_results[name] = {
+        'model': pipeline,
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'predictions': y_pred
+    }
+    
+    print(f"{name} - MAE: {mae:.2f}, RMSE: {rmse:.2f}, R²: {r2:.4f}")
+
+# Model 4: Neural Network for nb_entrees_cantine
+print("\nTraining Neural Network for nb_entrees_cantine...")
+
+preprocessor_cantine.fit(X_train_with_ho)
+X_train_cantine_processed = preprocessor_cantine.transform(X_train_with_ho)
+X_test_cantine_processed = preprocessor_cantine.transform(X_test_with_ho)
+
+feature_dim_cantine = X_train_cantine_processed.shape[1]
+
+nn_model_cantine = Sequential([
+    Dense(128, activation='relu', input_shape=(feature_dim_cantine,)),
+    BatchNormalization(),
+    Dropout(0.3),
+    Dense(64, activation='relu'),
+    BatchNormalization(),
+    Dropout(0.3), 
+    Dense(32, activation='relu'),
+    Dropout(0.2),
+    Dense(1, activation='linear')
+])
+
+nn_model_cantine.compile(
+    optimizer=Adam(learning_rate=0.001),
+    loss='mse',
+    metrics=['mae']
+)
+
+history_cantine = nn_model_cantine.fit(
+    X_train_cantine_processed, y_cantine_train,
+    epochs=100,
+    batch_size=32,
+    validation_split=0.2,
+    callbacks=[
+        EarlyStopping(patience=15, restore_best_weights=True),
+        ReduceLROnPlateau(factor=0.5, patience=10)
+    ],
+    verbose=0
+)
+
+nn_pred_cantine = nn_model_cantine.predict(X_test_cantine_processed).flatten()
+
+nn_mae_cantine = mean_absolute_error(y_cantine_test, nn_pred_cantine)
+nn_rmse_cantine = np.sqrt(mean_squared_error(y_cantine_test, nn_pred_cantine))
+nn_r2_cantine = r2_score(y_cantine_test, nn_pred_cantine)
+
+cantine_results['Neural Network'] = {
+    'model': nn_model_cantine,
+    'preprocessor': preprocessor_cantine, 
+    'mae': nn_mae_cantine,
+    'rmse': nn_rmse_cantine,
+    'r2': nn_r2_cantine,
+    'predictions': nn_pred_cantine
+}
+
+print(f"Neural Network - MAE: {nn_mae_cantine:.2f}, RMSE: {nn_rmse_cantine:.2f}, R²: {nn_r2_cantine:.4f}")
+
+# Select best model for nb_entrees_cantine
+best_cantine_model_name = min(cantine_results.items(), key=lambda x: x[1]['mae'])[0]
+best_cantine_model = cantine_results[best_cantine_model_name]
+print(f"\nBest model for nb_entrees_cantine: {best_cantine_model_name} with MAE: {best_cantine_model['mae']:.2f}")
+
+# Model Evaluation and Comparison
+print("\n" + "="*60)
+print("FINAL MODEL COMPARISON")
+print("="*60)
+
+print(f"\nnb_entrees_HO Models (Target: Company Entries):")
+for name, result in ho_results.items():
+    print(f"{name:20} MAE: {result['mae']:6.2f} RMSE: {result['rmse']:6.2f} R²: {result['r2']:7.4f}")
+
+print(f"\nnb_entrees_cantine Models (Target: Cantine Entries):")  
+for name, result in cantine_results.items():
+    print(f"{name:20} MAE: {result['mae']:6.2f} RMSE: {result['rmse']:6.2f} R²: {result['r2']:7.4f}")
+
+# Save the best models for deployment
+print("\nSaving best models for deployment...")
+
+# Save HO model
+if best_ho_model_name == 'Neural Network':
+    best_ho_model['model'].save('best_ho_model.h5')
+    joblib.dump(best_ho_model['preprocessor'], 'ho_preprocessor.pkl')
+else:
+    joblib.dump(best_ho_model['model'], 'best_ho_model.pkl')
+
+# Save cantine model  
+if best_cantine_model_name == 'Neural Network':
+    best_cantine_model['model'].save('best_cantine_model.h5')
+    joblib.dump(best_cantine_model['preprocessor'], 'cantine_preprocessor.pkl')
+else:
+    joblib.dump(best_cantine_model['model'], 'best_cantine_model.pkl')
+
+print("Models saved successfully!")
+
+# Deployment function for weekly predictions
+def predict_weekly_meals(future_data_file, ho_model, cantine_model, ho_is_nn=False, cantine_is_nn=False):
+    """
+    Predict meal requirements for the next week
+    """
+    # Load future data
+    future_data = pd.read_csv(future_data_file)
+    future_data['date'] = pd.to_datetime(future_data['date'])
+    
+    # Add the same features as training data
+    future_data['week_of_year'] = future_data['date'].dt.isocalendar().week
+    future_data['is_weekend'] = (future_data['jour_alpha'].isin(['Samedi', 'Dimanche'])).astype(int)
+    future_data['is_month_start'] = future_data['date'].dt.is_month_start.astype(int)
+    future_data['is_month_end'] = future_data['date'].dt.is_month_end.astype(int)
+    
+    # Prepare features
+    X_future = future_data[feature_columns]
+    
+    # Predict nb_entrees_HO
+    if ho_is_nn:
+        preprocessor = joblib.load('ho_preprocessor.pkl')
+        X_future_processed = preprocessor.transform(X_future)
+        ho_predictions = ho_model.predict(X_future_processed).flatten()
+    else:
+        ho_predictions = ho_model.predict(X_future)
+    
+    # Prepare data for cantine prediction
+    X_future_with_ho = X_future.copy()
+    X_future_with_ho['predicted_ho'] = ho_predictions
+    
+    # Predict nb_entrees_cantine
+    if cantine_is_nn:
+        preprocessor_cantine = joblib.load('cantine_preprocessor.pkl')
+        X_future_cantine_processed = preprocessor_cantine.transform(X_future_with_ho)
+        cantine_predictions = cantine_model.predict(X_future_cantine_processed).flatten()
+    else:
+        cantine_predictions = cantine_model.predict(X_future_with_ho)
+    
+    # Create results dataframe
+    results = future_data[['date', 'jour_alpha']].copy()
+    results['predicted_ho_entries'] = ho_predictions
+    results['predicted_cantine_entries'] = cantine_predictions
+    results['recommended_meals'] = np.round(cantine_predictions).astype(int)
+    
+    # Ensure minimum of 1 meal and maximum based on your capacity
+    results['recommended_meals'] = results['recommended_meals'].clip(lower=1, upper=500)
+    
+    return results
+
+# Example usage for deployment (commented out since we don't have future_data.csv yet)
+"""
+# Load saved models
+try:
+    best_ho_model = tf.keras.models.load_model('best_ho_model.h5')
+    ho_is_nn = True
+except:
+    best_ho_model = joblib.load('best_ho_model.pkl') 
+    ho_is_nn = False
+
+try:
+    best_cantine_model = tf.keras.models.load_model('best_cantine_model.h5')
+    cantine_is_nn = True
+except:
+    best_cantine_model = joblib.load('best_cantine_model.pkl')
+    cantine_is_nn = False
+
+# Generate predictions for next week
+weekly_predictions = predict_weekly_meals(
+    'future_data.csv', 
+    best_ho_model, 
+    best_cantine_model,
+    ho_is_nn, 
+    cantine_is_nn
+)
+
+print("\nWeekly Meal Recommendations:")
+print(weekly_predictions)
+
+# Save recommendations
+weekly_predictions.to_csv('weekly_meal_recommendations.csv', index=False)
+print("\nRecommendations saved to 'weekly_meal_recommendations.csv'")
+"""
+
+print("\nDeployment code ready! Use the predict_weekly_meals() function with your future_data.csv")
+print("The system will automatically recommend meal quantities for each day of the upcoming week.")
