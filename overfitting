@@ -1,0 +1,598 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import warnings
+warnings.filterwarnings('ignore')
+
+# Scikit-learn imports
+from sklearn.model_selection import train_test_split, cross_val_score, KFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.impute import SimpleImputer
+from sklearn.feature_selection import SelectKBest, f_regression
+
+# XGBoost and potentially TensorFlow
+import xgboost as xgb
+print("All libraries imported successfully!")
+
+
+
+# Assuming your historical data is loaded as df
+# df = pd.read_csv('your_historical_data.csv')
+
+def prepare_data(df):
+    """
+    Prepare the dataset with feature engineering and preprocessing
+    """
+    # Create a copy to avoid modifying original data
+    data = df.copy()
+    
+    # Convert date column to datetime
+    data['date'] = pd.to_datetime(data['date'])
+    
+    # Map jour_alpha to numerical day_week
+    day_mapping = {
+        'dimanche': 0, 'lundi': 1, 'mardi': 2, 'mercredi': 3,
+        'jeudi': 4, 'vendredi': 5, 'samedi': 6
+    }
+    data['day_week'] = data['jour_alpha'].map(day_mapping)
+    
+    # Drop the original jour_alpha column
+    data.drop(columns=['jour_alpha'], inplace=True)
+    
+    # Add additional time features (seasonal patterns)
+    data['day_of_year'] = data['date'].dt.dayofyear
+    data['week_of_year'] = data['date'].dt.isocalendar().week
+    data['is_weekend'] = (data['day_week'] >= 5).astype(int)
+    
+    # Month cycles (sine/cosine transformation)
+    data['month_sin'] = np.sin(2 * np.pi * data['mois']/12)
+    data['month_cos'] = np.cos(2 * np.pi * data['mois']/12)
+    
+    # Day cycles
+    data['day_sin'] = np.sin(2 * np.pi * data['jour']/31)
+    data['day_cos'] = np.cos(2 * np.pi * data['jour']/31)
+    
+    # Academic period feature (combining BEM and BAC)
+    data['exam_period'] = ((data['BEM'] == 1) | (data['BAC'] == 1)).astype(int)
+    
+    return data
+
+# Apply data preparation
+# df_processed = prepare_data(df)
+
+
+def create_preprocessor(numerical_features, categorical_features):
+    """
+    Create preprocessing pipeline for numerical and categorical features
+    """
+    numerical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ])
+    
+    categorical_transformer = Pipeline(steps=[
+        ('imputer', SimpleImputer(strategy='most_frequent')),
+        ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+    ])
+    
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', numerical_transformer, numerical_features),
+            ('cat', categorical_transformer, categorical_features)
+        ])
+    
+    return preprocessor
+
+# Define feature sets
+numerical_features = ['temperature', 'vitesse du vent', 'jour', 'mois', 'annee', 
+                     'day_week', 'day_of_year', 'week_of_year', 'month_sin', 'month_cos',
+                     'day_sin', 'day_cos']
+
+categorical_features = ['conge_scolaires', 'jeune_tres_probable', 'jeune_probable', 
+                       'clair', 'nuageux', 'fortement nuageux', 'pluie', 
+                       'BEM', 'BAC', 'hiver', 'printemps', 'ete', 'automne',
+                       'is_weekend', 'exam_period']
+
+
+def evaluate_model(model, X_train, X_test, y_train, y_test, model_name=""):
+    """
+    Comprehensive model evaluation with overfitting/underfitting check
+    """
+    # Predictions
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+    
+    # Calculate metrics
+    train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+    test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+    train_mae = mean_absolute_error(y_train, y_train_pred)
+    test_mae = mean_absolute_error(y_test, y_test_pred)
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    
+    # Overfitting/Underfitting analysis
+    overfitting_gap = train_rmse - test_rmse
+    performance_gap = abs(train_r2 - test_r2)
+    
+    print(f"\n{'='*50}")
+    print(f"Model: {model_name}")
+    print(f"{'='*50}")
+    print(f"Train RMSE: {train_rmse:.2f}, Test RMSE: {test_rmse:.2f}")
+    print(f"Train MAE: {train_mae:.2f}, Test MAE: {test_mae:.2f}")
+    print(f"Train R²: {train_r2:.4f}, Test R²: {test_r2:.4f}")
+    
+    # Diagnose fitting issues
+    if train_rmse > test_rmse + 10 and train_r2 < 0.7:
+        print("🔍 Potential UNDERFITTING: Poor performance on both train and test sets")
+    elif train_rmse < test_rmse - 10 and performance_gap > 0.1:
+        print("🔍 Potential OVERFITTING: Good train performance but poor test performance")
+    else:
+        print("✅ Model shows GOOD GENERALIZATION")
+    
+    return {
+        'model': model,
+        'train_rmse': train_rmse,
+        'test_rmse': test_rmse,
+        'train_r2': train_r2,
+        'test_r2': test_r2,
+        'overfitting_gap': overfitting_gap
+    }
+
+def cross_validate_model(pipeline, X, y, cv=5):
+    """
+    Perform cross-validation
+    """
+    cv_scores = cross_val_score(pipeline, X, y, cv=cv, scoring='neg_mean_squared_error')
+    cv_rmse = np.sqrt(-cv_scores)
+    return cv_rmse.mean(), cv_rmse.std()
+
+
+def step1_predict_entrees_ho(df_processed):
+    """
+    Step 1: Predict nb_entrees_HO without using nb_entrees_cantine
+    """
+    print("Starting Step 1: Predicting nb_entrees_HO")
+    
+    # Filter data for training period
+    train_data = df_processed[df_processed['date'] <= '2024-09-26'].copy()
+    
+    # Define features and target
+    features = numerical_features + categorical_features
+    X = train_data[features]
+    y = train_data['nb_entrees_HO']
+    
+    # Split data - maintaining temporal order
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, shuffle=False
+    )
+    
+    # Create preprocessor
+    preprocessor = create_preprocessor(numerical_features, categorical_features)
+    
+    # Define models with their parameter grids
+    models = {
+        'Ridge': {
+            'model': Ridge(),
+            'params': {
+                'regressor__alpha': [0.1, 1.0, 10.0, 100.0]
+            }
+        },
+        'Lasso': {
+            'model': Lasso(),
+            'params': {
+                'regressor__alpha': [0.1, 1.0, 10.0, 100.0],
+                'regressor__max_iter': [1000, 2000]
+            }
+        },
+        'RandomForest': {
+            'model': RandomForestRegressor(random_state=42),
+            'params': {
+                'regressor__n_estimators': [100, 200],
+                'regressor__max_depth': [10, 20, None],
+                'regressor__min_samples_split': [2, 5]
+            }
+        },
+        'XGBoost': {
+            'model': xgb.XGBRegressor(random_state=42),
+            'params': {
+                'regressor__n_estimators': [100, 200],
+                'regressor__max_depth': [3, 6, 9],
+                'regressor__learning_rate': [0.01, 0.1, 0.2],
+                'regressor__subsample': [0.8, 0.9, 1.0]
+            }
+        }
+    }
+    
+    best_model = None
+    best_score = float('inf')
+    results = {}
+    
+    # Train and evaluate each model
+    for name, config in models.items():
+        print(f"\nTraining {name}...")
+        
+        # Create pipeline
+        pipeline = Pipeline([
+            ('preprocessor', preprocessor),
+            ('regressor', config['model'])
+        ])
+        
+        # Hyperparameter tuning with cross-validation
+        grid_search = GridSearchCV(
+            pipeline, config['params'], 
+            cv=5, scoring='neg_mean_squared_error', n_jobs=-1
+        )
+        
+        grid_search.fit(X_train, y_train)
+        
+        # Evaluate best model
+        cv_rmse, cv_std = cross_validate_model(grid_search.best_estimator_, X_train, y_train)
+        evaluation = evaluate_model(
+            grid_search.best_estimator_, X_train, X_test, y_train, y_test, name
+        )
+        
+        results[name] = {
+            'model': grid_search.best_estimator_,
+            'evaluation': evaluation,
+            'cv_rmse': cv_rmse,
+            'cv_std': cv_std,
+            'best_params': grid_search.best_params_
+        }
+        
+        print(f"Cross-validation RMSE: {cv_rmse:.2f} ± {cv_std:.2f}")
+        print(f"Best parameters: {grid_search.best_params_}")
+        
+        # Update best model
+        if evaluation['test_rmse'] < best_score:
+            best_score = evaluation['test_rmse']
+            best_model = grid_search.best_estimator_
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print("STEP 1 SUMMARY: nb_entrees_HO Prediction")
+    print(f"{'='*60}")
+    for name, result in results.items():
+        eval_data = result['evaluation']
+        print(f"{name}: Test RMSE = {eval_data['test_rmse']:.2f}, Test R² = {eval_data['test_r2']:.4f}")
+    
+    best_model_name = min(results.keys(), key=lambda x: results[x]['evaluation']['test_rmse'])
+    print(f"\n🏆 BEST MODEL: {best_model_name} with Test RMSE = {best_score:.2f}")
+    
+    return best_model, results
+
+# Execute Step 1
+# best_model_ho, results_ho = step1_predict_entrees_ho(df_processed)
+
+
+
+def step2_predict_entrees_cantine(df_processed, best_model_ho):
+    """
+    Step 2: Predict nb_entrees_cantine using nb_entrees_HO as feature
+    """
+    print("\n" + "="*60)
+    print("Starting Step 2: Predicting nb_entrees_cantine")
+    print("="*60)
+    
+    # Filter data for training period
+    train_data = df_processed[df_processed['date'] <= '2024-09-26'].copy()
+    
+    # Add nb_entrees_HO to numerical features for this step
+    features_step2 = numerical_features + categorical_features + ['nb_entrees_HO']
+    
+    # Define features and target
+    X = train_data[features_step2]
+    y = train_data['nb_entrees_cantine']
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, shuffle=False
+    )
+    
+    # Update preprocessor for step 2 features
+    preprocessor_step2 = create_preprocessor(
+        numerical_features + ['nb_entrees_HO'], 
+        categorical_features
+    )
+    
+    # Define models (same as step 1 but with updated features)
+    models_step2 = {
+        'Ridge': {
+            'model': Ridge(),
+            'params': {'regressor__alpha': [0.1, 1.0, 10.0, 100.0]}
+        },
+        'XGBoost': {
+            'model': xgb.XGBRegressor(random_state=42),
+            'params': {
+                'regressor__n_estimators': [100, 200],
+                'regressor__max_depth': [3, 6, 9],
+                'regressor__learning_rate': [0.01, 0.1, 0.2]
+            }
+        }
+    }
+    
+    best_model_cantine = None
+    best_score_cantine = float('inf')
+    results_step2 = {}
+    
+    for name, config in models_step2.items():
+        print(f"\nTraining {name} for cafeteria entries...")
+        
+        pipeline = Pipeline([
+            ('preprocessor', preprocessor_step2),
+            ('regressor', config['model'])
+        ])
+        
+        grid_search = GridSearchCV(
+            pipeline, config['params'], 
+            cv=5, scoring='neg_mean_squared_error', n_jobs=-1
+        )
+        
+        grid_search.fit(X_train, y_train)
+        
+        evaluation = evaluate_model(
+            grid_search.best_estimator_, X_train, X_test, y_train, y_test, 
+            f"{name} (Cantine)"
+        )
+        
+        results_step2[name] = {
+            'model': grid_search.best_estimator_,
+            'evaluation': evaluation,
+            'best_params': grid_search.best_params_
+        }
+        
+        if evaluation['test_rmse'] < best_score_cantine:
+            best_score_cantine = evaluation['test_rmse']
+            best_model_cantine = grid_search.best_estimator_
+    
+    return best_model_cantine, results_step2
+
+# Execute Step 2
+# best_model_cantine, results_cantine = step2_predict_entrees_cantine(df_processed, best_model_ho)
+
+
+
+def create_future_dates(start_date='2024-09-29', end_date='2024-12-31'):
+    """
+    Create future dates dataframe with all required features
+    """
+    dates = pd.date_range(start=start_date, end=end_date, freq='D')
+    
+    future_df = pd.DataFrame({'date': dates})
+    
+    # Add basic date features
+    future_df['jour'] = future_df['date'].dt.day
+    future_df['mois'] = future_df['date'].dt.month
+    future_df['annee'] = future_df['date'].dt.year
+    future_df['day_week'] = future_df['date'].dt.dayofweek
+    
+    # Map to French day names for jour_alpha mapping
+    day_names = {0: 'lundi', 1: 'mardi', 2: 'mercredi', 3: 'jeudi', 
+                 4: 'vendredi', 5: 'samedi', 6: 'dimanche'}
+    future_df['jour_alpha'] = future_df['day_week'].map(day_names)
+    
+    # Apply the same preprocessing as training data
+    future_processed = prepare_data(future_df)
+    
+    return future_processed
+
+def predict_future_values(best_model_ho, best_model_cantine, df_processed):
+    """
+    Predict future values for both targets
+    """
+    print("\n" + "="*60)
+    print("Generating Future Predictions")
+    print("="*60)
+    
+    # Create future dates
+    future_data = create_future_dates()
+    
+    # Prepare features for Step 1 prediction
+    features_ho = numerical_features + categorical_features
+    X_future_ho = future_data[features_ho]
+    
+    # Predict nb_entrees_HO for future dates
+    future_ho_predictions = best_model_ho.predict(X_future_ho)
+    future_data['predicted_nb_entrees_HO'] = future_ho_predictions
+    
+    # Prepare features for Step 2 prediction (using predicted HO values)
+    features_cantine = numerical_features + categorical_features + ['predicted_nb_entrees_HO']
+    X_future_cantine = future_data[features_cantine]
+    
+    # Predict nb_entrees_cantine for future dates
+    future_cantine_predictions = best_model_cantine.predict(X_future_cantine)
+    future_data['predicted_nb_entrees_cantine'] = future_cantine_predictions
+    
+    # Create final output
+    final_predictions = future_data[[
+        'date', 'predicted_nb_entrees_HO', 'predicted_nb_entrees_cantine'
+    ]].copy()
+    
+    # Ensure predictions are reasonable (non-negative, realistic ranges)
+    final_predictions['predicted_nb_entrees_HO'] = final_predictions['predicted_nb_entrees_HO'].clip(lower=0)
+    final_predictions['predicted_nb_entrees_cantine'] = final_predictions['predicted_nb_entrees_cantine'].clip(lower=0)
+    
+    print(f"Generated predictions for {len(final_predictions)} future dates")
+    print(f"Date range: {final_predictions['date'].min()} to {final_predictions['date'].max()}")
+    print(f"Average predicted company entries: {final_predictions['predicted_nb_entrees_HO'].mean():.0f}")
+    print(f"Average predicted cafeteria entries: {final_predictions['predicted_nb_entrees_cantine'].mean():.0f}")
+    
+    return final_predictions
+
+
+
+
+def create_visualizations(df_processed, final_predictions, results_ho, results_cantine):
+    """
+    Create comprehensive visualizations
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # 1. Historical vs Predicted Trends
+    historical_dates = df_processed['date']
+    historical_ho = df_processed['nb_entrees_HO']
+    historical_cantine = df_processed['nb_entrees_cantine']
+    
+    axes[0, 0].plot(historical_dates, historical_ho, alpha=0.7, label='Historical Company Entries')
+    axes[0, 0].plot(historical_dates, historical_cantine, alpha=0.7, label='Historical Cafeteria Entries')
+    axes[0, 0].set_title('Historical Entries Pattern')
+    axes[0, 0].set_ylabel('Number of Entries')
+    axes[0, 0].legend()
+    axes[0, 0].tick_params(axis='x', rotation=45)
+    
+    # 2. Future Predictions
+    axes[0, 1].plot(final_predictions['date'], final_predictions['predicted_nb_entrees_HO'], 
+                    label='Predicted Company Entries', linewidth=2)
+    axes[0, 1].plot(final_predictions['date'], final_predictions['predicted_nb_entrees_cantine'], 
+                    label='Predicted Cafeteria Entries', linewidth=2)
+    axes[0, 1].axhline(y=400, color='red', linestyle='--', label='Current Meal Order (400)')
+    axes[0, 1].set_title('Future Predictions (Sep-Dec 2024)')
+    axes[0, 1].set_ylabel('Predicted Entries')
+    axes[0, 1].legend()
+    axes[0, 1].tick_params(axis='x', rotation=45)
+    
+    # 3. Model Performance Comparison
+    models_ho = list(results_ho.keys())
+    test_rmse_ho = [results_ho[m]['evaluation']['test_rmse'] for m in models_ho]
+    
+    models_cantine = list(results_cantine.keys())
+    test_rmse_cantine = [results_cantine[m]['evaluation']['test_rmse'] for m in models_cantine]
+    
+    x = np.arange(len(models_ho))
+    width = 0.35
+    
+    axes[1, 0].bar(x - width/2, test_rmse_ho, width, label='Company Entries RMSE')
+    axes[1, 0].bar(x + width/2, test_rmse_cantine, width, label='Cafeteria Entries RMSE')
+    axes[1, 0].set_xlabel('Models')
+    axes[1, 0].set_ylabel('Test RMSE')
+    axes[1, 0].set_title('Model Performance Comparison')
+    axes[1, 0].set_xticks(x)
+    axes[1, 0].set_xticklabels(models_ho)
+    axes[1, 0].legend()
+    
+    # 4. Meal Planning Recommendation
+    excess_days = (final_predictions['predicted_nb_entrees_cantine'] > 400).sum()
+    shortage_days = (final_predictions['predicted_nb_entrees_cantine'] < 400).sum()
+    optimal_days = (final_predictions['predicted_nb_entrees_cantine'] == 400).sum()
+    
+    labels = ['Excess (>400)', 'Shortage (<400)', 'Optimal (=400)']
+    sizes = [excess_days, shortage_days, optimal_days]
+    
+    axes[1, 1].pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+    axes[1, 1].set_title('Meal Planning Analysis (Sep-Dec 2024)')
+    
+    plt.tight_layout()
+    plt.savefig('cafeteria_analysis.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Print recommendations
+    avg_predicted = final_predictions['predicted_nb_entrees_cantine'].mean()
+    print(f"\n📊 MEAL PLANNING RECOMMENDATIONS:")
+    print(f"Average predicted cafeteria entries: {avg_predicted:.0f}")
+    print(f"Days with potential food waste (entries < 400): {excess_days}")
+    print(f"Days with potential shortage (entries > 400): {shortage_days}")
+    print(f"Recommended daily meal preparation: {max(350, min(450, int(avg_predicted)))}")
+
+def save_predictions(final_predictions):
+    """
+    Save predictions to CSV file
+    """
+    # Create final output DataFrame
+    output_df = final_predictions.copy()
+    
+    # Round predictions to integers
+    output_df['predicted_nb_entrees_HO'] = output_df['predicted_nb_entrees_HO'].round().astype(int)
+    output_df['predicted_nb_entrees_cantine'] = output_df['predicted_nb_entrees_cantine'].round().astype(int)
+    
+    # Rename columns to match requested format
+    output_df.columns = ['date', 'nb_entrees_HO', 'nb_entrees_cantine']
+    
+    # Save to CSV
+    output_df.to_csv('cafeteria_predictions_2024.csv', index=False)
+    print(f"\n💾 Predictions saved to 'cafeteria_predictions_2024.csv'")
+    print(f"File contains predictions from {output_df['date'].min()} to {output_df['date'].max()}")
+    
+    return output_df
+
+
+
+
+
+
+
+def main():
+    """
+    Main execution function
+    """
+    print("🏢 Company Cafeteria Predictive Analytics System")
+    print("="*60)
+    
+    # Load your data here (replace with your actual data loading)
+    # df = pd.read_csv('your_historical_data.csv')
+    
+    # For demonstration, creating sample data structure
+    # Remove this section and use your actual data
+    print("⚠️  NOTE: Replace the sample data section with your actual data loading")
+    dates = pd.date_range(start='2022-05-05', end='2024-09-26', freq='D')
+    sample_data = pd.DataFrame({
+        'date': dates,
+        'jour': np.random.randint(1, 32, len(dates)),
+        'mois': np.random.randint(1, 13, len(dates)),
+        'annee': np.random.randint(2022, 2025, len(dates)),
+        'jour_alpha': np.random.choice(['lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi', 'dimanche'], len(dates)),
+        'conge_scolaires': np.random.randint(0, 2, len(dates)),
+        'jeune_tres_probable': np.random.randint(0, 2, len(dates)),
+        'jeune_probable': np.random.randint(0, 2, len(dates)),
+        'temperature': np.random.uniform(10, 40, len(dates)),
+        'vitesse du vent': np.random.uniform(0, 30, len(dates)),
+        'clair': np.random.randint(0, 2, len(dates)),
+        'nuageux': np.random.randint(0, 2, len(dates)),
+        'fortement nuageux': np.random.randint(0, 2, len(dates)),
+        'pluie': np.random.randint(0, 2, len(dates)),
+        'BEM': np.random.randint(0, 2, len(dates)),
+        'BAC': np.random.randint(0, 2, len(dates)),
+        'hiver': np.random.randint(0, 2, len(dates)),
+        'printemps': np.random.randint(0, 2, len(dates)),
+        'ete': np.random.randint(0, 2, len(dates)),
+        'automne': np.random.randint(0, 2, len(dates)),
+        'nb_entrees_HO': np.random.randint(300, 600, len(dates)),
+        'nb_entrees_cantine': np.random.randint(250, 500, len(dates))
+    })
+    
+    df = sample_data  # Replace this with your actual DataFrame
+    
+    # Data Preparation
+    df_processed = prepare_data(df)
+    
+    # Step 1: Predict company entries
+    best_model_ho, results_ho = step1_predict_entrees_ho(df_processed)
+    
+    # Step 2: Predict cafeteria entries
+    best_model_cantine, results_cantine = step2_predict_entrees_cantine(df_processed, best_model_ho)
+    
+    # Future Predictions
+    final_predictions = predict_future_values(best_model_ho, best_model_cantine, df_processed)
+    
+    # Visualizations
+    create_visualizations(df_processed, final_predictions, results_ho, results_cantine)
+    
+    # Save results
+    output_df = save_predictions(final_predictions)
+    
+    print("\n✅ Analysis completed successfully!")
+    return output_df, best_model_ho, best_model_cantine
+
+# Execute the main function
+if __name__ == "__main__":
+    final_results, model_ho, model_cantine = main()
+
+
+
+
+
