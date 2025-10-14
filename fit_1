@@ -1,0 +1,490 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge, Lasso
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+from sklearn.model_selection import train_test_split, TimeSeriesSplit, GridSearchCV, cross_val_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.feature_selection import SelectFromModel
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+
+class CanteenDemandPredictor:
+    def __init__(self):
+        self.models = {}
+        self.preprocessors = {}
+        self.scalers = {}
+        self.best_models = {}
+        
+    def create_time_features(self, df):
+        """Create advanced time-based features"""
+        df = df.copy()
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # Basic time features
+        df['day_of_week'] = df['date'].dt.dayofweek
+        df['day_of_year'] = df['date'].dt.dayofyear
+        df['week_of_year'] = df['date'].dt.isocalendar().week
+        df['quarter'] = df['date'].dt.quarter
+        df['is_weekend'] = (df['date'].dt.dayofweek >= 5).astype(int)
+        
+        # Islamic calendar features (simplified - you may enhance this)
+        df['ramadan_proximity'] = self.calculate_ramadan_proximity(df['date'])
+        
+        # Seasonal patterns
+        df['sin_day_of_year'] = np.sin(2 * np.pi * df['day_of_year'] / 365)
+        df['cos_day_of_year'] = np.cos(2 * np.pi * df['day_of_year'] / 365)
+        df['sin_month'] = np.sin(2 * np.pi * df['mois'] / 12)
+        df['cos_month'] = np.cos(2 * np.pi * df['mois'] / 12)
+        
+        # Academic period features
+        df['exam_period'] = (df['BEM'] | df['BAC']).astype(int)
+        df['school_break_effect'] = df['conge_scolaires'] * df['exam_period']
+        
+        return df
+    
+    def calculate_ramadan_proximity(self, dates):
+        """Calculate proximity to Ramadan (simplified implementation)"""
+        # This is a simplified version - you should implement proper Islamic calendar
+        ramadan_proximity = []
+        for date in dates:
+            # Placeholder: Ramadan typically in April-May, adjust as needed
+            ramadan_start = datetime(date.year, 4, 1) if date.month >= 4 else datetime(date.year-1, 4, 1)
+            days_to_ramadan = abs((date - ramadan_start).days)
+            proximity = max(0, 1 - days_to_ramadan / 30)  # 30 days window
+            ramadan_proximity.append(proximity)
+        return ramadan_proximity
+    
+    def prepare_features(self, df, target, include_entrees_ho=False):
+        """Prepare features for modeling"""
+        df_processed = self.create_time_features(df)
+        
+        # Define feature sets
+        numerical_features = ['temperature', 'vitesse du vent', 'day_of_year', 'week_of_year', 
+                             'sin_day_of_year', 'cos_day_of_year', 'sin_month', 'cos_month',
+                             'ramadan_proximity']
+        
+        categorical_features = ['mois', 'annee', 'conge_scolaires', 'jeune_tres_probable', 
+                               'jeune_probable', 'clair', 'nuageux', 'fortement nuageux', 
+                               'pluie', 'BEM', 'BAC', 'hiver', 'printemps', 'ete', 'automne',
+                               'is_weekend', 'exam_period', 'school_break_effect']
+        
+        if include_entrees_ho:
+            numerical_features.append('nb_entrees_HO')
+        
+        # Separate features and target
+        X = df_processed[numerical_features + categorical_features]
+        y = df_processed[target]
+        
+        return X, y, numerical_features, categorical_features
+    
+    def create_preprocessor(self, numerical_features, categorical_features):
+        """Create preprocessing pipeline"""
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', StandardScaler(), numerical_features),
+                ('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False), categorical_features)
+            ])
+        return preprocessor
+    
+    def evaluate_model(self, model, X_train, X_test, y_train, y_test, model_name):
+        """Comprehensive model evaluation"""
+        # Training performance
+        y_train_pred = model.predict(X_train)
+        train_mae = mean_absolute_error(y_train, y_train_pred)
+        train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
+        train_r2 = r2_score(y_train, y_train_pred)
+        
+        # Testing performance
+        y_test_pred = model.predict(X_test)
+        test_mae = mean_absolute_error(y_test, y_test_pred)
+        test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
+        test_r2 = r2_score(y_test, y_test_pred)
+        
+        # Overfitting assessment
+        overfit_metric = (train_rmse - test_rmse) / train_rmse
+        
+        results = {
+            'model': model_name,
+            'train_mae': train_mae,
+            'train_rmse': train_rmse,
+            'train_r2': train_r2,
+            'test_mae': test_mae,
+            'test_rmse': test_rmse,
+            'test_r2': test_r2,
+            'overfit_indicator': overfit_metric
+        }
+        
+        return results, y_test_pred
+    
+    def plot_predictions(self, y_true, y_pred, model_name, dates):
+        """Visualize predictions vs actual values"""
+        plt.figure(figsize=(15, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(dates, y_true, label='Actual', alpha=0.7)
+        plt.plot(dates, y_pred, label='Predicted', alpha=0.7)
+        plt.title(f'{model_name} - Predictions vs Actual')
+        plt.legend()
+        
+        plt.subplot(1, 2, 2)
+        plt.scatter(y_true, y_pred, alpha=0.6)
+        plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+        plt.xlabel('Actual')
+        plt.ylabel('Predicted')
+        plt.title(f'{model_name} - Actual vs Predicted')
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def train_models_step1(self, df):
+        """Step 1: Predict nb_entrees_HO"""
+        print("=" * 50)
+        print("STEP 1: Predicting nb_entrees_HO")
+        print("=" * 50)
+        
+        # Prepare features
+        X, y, num_features, cat_features = self.prepare_features(df, 'nb_entrees_HO')
+        
+        # Time-based split to avoid data leakage :cite[6]
+        dates = pd.to_datetime(df['date'])
+        split_date = dates.quantile(0.8)  # 80% for training, 20% for testing
+        train_mask = dates <= split_date
+        test_mask = dates > split_date
+        
+        X_train, X_test = X[train_mask], X[test_mask]
+        y_train, y_test = y[train_mask], y[test_mask]
+        dates_test = dates[test_mask]
+        
+        # Create preprocessor
+        preprocessor = self.create_preprocessor(num_features, cat_features)
+        
+        # Define models with regularization to prevent overfitting :cite[4]
+        models = {
+            'Ridge': Pipeline([
+                ('preprocessor', preprocessor),
+                ('regressor', Ridge(alpha=1.0))
+            ]),
+            'Lasso': Pipeline([
+                ('preprocessor', preprocessor),
+                ('regressor', Lasso(alpha=0.1, max_iter=10000))
+            ]),
+            'RandomForest': Pipeline([
+                ('preprocessor', preprocessor),
+                ('regressor', RandomForestRegressor(n_estimators=100, random_state=42))
+            ]),
+            'GradientBoosting': Pipeline([
+                ('preprocessor', preprocessor),
+                ('regressor', GradientBoostingRegressor(n_estimators=100, random_state=42))
+            ])
+        }
+        
+        # Hyperparameter tuning with TimeSeriesSplit :cite[6]
+        param_grids = {
+            'Ridge': {'regressor__alpha': [0.1, 1.0, 10.0]},
+            'Lasso': {'regressor__alpha': [0.01, 0.1, 1.0]},
+            'RandomForest': {'regressor__n_estimators': [50, 100]},
+            'GradientBoosting': {'regressor__n_estimators': [50, 100], 'regressor__learning_rate': [0.01, 0.1]}
+        }
+        
+        tscv = TimeSeriesSplit(n_splits=5)
+        best_models = {}
+        all_results = []
+        
+        for name, model in models.items():
+            print(f"Training {name}...")
+            
+            # Use cross-validation for robust evaluation :cite[4]:cite[6]
+            if name in param_grids:
+                grid_search = GridSearchCV(
+                    model, param_grids[name], cv=tscv, 
+                    scoring='neg_mean_squared_error', n_jobs=-1
+                )
+                grid_search.fit(X_train, y_train)
+                best_model = grid_search.best_estimator_
+            else:
+                best_model = model
+                best_model.fit(X_train, y_train)
+            
+            # Evaluate model
+            results, y_pred = self.evaluate_model(
+                best_model, X_train, X_test, y_train, y_test, name
+            )
+            all_results.append(results)
+            best_models[name] = best_model
+            
+            # Plot predictions for the best model
+            if name == 'Ridge':  # Plot for one model to avoid too many plots
+                self.plot_predictions(y_test.values, y_pred, name, dates_test)
+        
+        # Select best model based on test RMSE
+        results_df = pd.DataFrame(all_results)
+        best_model_name = results_df.loc[results_df['test_rmse'].idxmin(), 'model']
+        self.best_models['step1'] = best_models[best_model_name]
+        
+        print("\nStep 1 Results:")
+        print(results_df.round(4))
+        print(f"\nBest model for Step 1: {best_model_name}")
+        
+        return self.best_models['step1'], results_df
+    
+    def train_models_step2(self, df, ho_predictions):
+        """Step 2: Predict nb_entrees_cantine using nb_entrees_HO predictions"""
+        print("\n" + "=" * 50)
+        print("STEP 2: Predicting nb_entrees_cantine")
+        print("=" * 50)
+        
+        # Add nb_entrees_HO predictions to the dataframe
+        df_step2 = df.copy()
+        df_step2['nb_entrees_HO'] = ho_predictions
+        
+        # Prepare features including nb_entrees_HO
+        X, y, num_features, cat_features = self.prepare_features(
+            df_step2, 'nb_entrees_cantine', include_entrees_ho=True
+        )
+        
+        # Time-based split
+        dates = pd.to_datetime(df_step2['date'])
+        split_date = dates.quantile(0.8)
+        train_mask = dates <= split_date
+        test_mask = dates > split_date
+        
+        X_train, X_test = X[train_mask], X[test_mask]
+        y_train, y_test = y[train_mask], y[test_mask]
+        dates_test = dates[test_mask]
+        
+        # Create preprocessor
+        preprocessor = self.create_preprocessor(num_features, cat_features)
+        
+        # Define models
+        models = {
+            'Ridge': Pipeline([
+                ('preprocessor', preprocessor),
+                ('regressor', Ridge(alpha=1.0))
+            ]),
+            'Lasso': Pipeline([
+                ('preprocessor', preprocessor),
+                ('regressor', Lasso(alpha=0.1, max_iter=10000))
+            ]),
+            'RandomForest': Pipeline([
+                ('preprocessor', preprocessor),
+                ('regressor', RandomForestRegressor(n_estimators=100, random_state=42))
+            ]),
+            'GradientBoosting': Pipeline([
+                ('preprocessor', preprocessor),
+                ('regressor', GradientBoostingRegressor(n_estimators=100, random_state=42))
+            ])
+        }
+        
+        # Hyperparameter tuning
+        param_grids = {
+            'Ridge': {'regressor__alpha': [0.1, 1.0, 10.0]},
+            'Lasso': {'regressor__alpha': [0.01, 0.1, 1.0]},
+            'RandomForest': {'regressor__n_estimators': [50, 100]},
+            'GradientBoosting': {'regressor__n_estimators': [50, 100], 'regressor__learning_rate': [0.01, 0.1]}
+        }
+        
+        tscv = TimeSeriesSplit(n_splits=5)
+        best_models = {}
+        all_results = []
+        
+        for name, model in models.items():
+            print(f"Training {name}...")
+            
+            if name in param_grids:
+                grid_search = GridSearchCV(
+                    model, param_grids[name], cv=tscv, 
+                    scoring='neg_mean_squared_error', n_jobs=-1
+                )
+                grid_search.fit(X_train, y_train)
+                best_model = grid_search.best_estimator_
+            else:
+                best_model = model
+                best_model.fit(X_train, y_train)
+            
+            results, y_pred = self.evaluate_model(
+                best_model, X_train, X_test, y_train, y_test, name
+            )
+            all_results.append(results)
+            best_models[name] = best_model
+            
+            if name == 'Ridge':
+                self.plot_predictions(y_test.values, y_pred, name, dates_test)
+        
+        # Select best model
+        results_df = pd.DataFrame(all_results)
+        best_model_name = results_df.loc[results_df['test_rmse'].idxmin(), 'model']
+        self.best_models['step2'] = best_models[best_model_name]
+        
+        print("\nStep 2 Results:")
+        print(results_df.round(4))
+        print(f"\nBest model for Step 2: {best_model_name}")
+        
+        return self.best_models['step2'], results_df
+    
+    def predict_future(self, df, start_date='2024-09-29', end_date='2024-12-31'):
+        """Generate predictions for future dates"""
+        print("\n" + "=" * 50)
+        print("GENERATING FUTURE PREDICTIONS")
+        print("=" * 50)
+        
+        # Create future dates dataframe
+        future_dates = pd.date_range(start=start_date, end=end_date, freq='D')
+        future_df = pd.DataFrame({'date': future_dates})
+        
+        # Add basic date features
+        future_df['jour'] = future_df['date'].dt.day
+        future_df['mois'] = future_df['date'].dt.month
+        future_df['annee'] = future_df['date'].dt.year
+        
+        # You'll need to fill in other features for future dates
+        # This is a template - you need to provide actual values for:
+        # conge_scolaires, jeune_tres_probable, jeune_probable, temperature, 
+        # vitesse du vent, clair, nuageux, fortement nuageux, pluie, BEM, BAC, 
+        # and seasonal features
+        
+        print("Please provide the following features for future dates:")
+        print(" - conge_scolaires, jeune_tres_probable, jeune_probable")
+        print(" - temperature, vitesse du vent, weather conditions")
+        print(" - BEM, BAC exam periods")
+        print(" - Seasonal features (hiver, printemps, ete, automne)")
+        
+        # For demonstration, creating placeholder values
+        for col in ['conge_scolaires', 'jeune_tres_probable', 'jeune_probable', 
+                   'clair', 'nuageux', 'fortement nuageux', 'pluie', 'BEM', 'BAC',
+                   'hiver', 'printemps', 'ete', 'automne']:
+            future_df[col] = 0
+        
+        # Placeholder weather data
+        future_df['temperature'] = 20  # Average temperature
+        future_df['vitesse du vent'] = 10  # Average wind speed
+        
+        # Set seasonal features based on months
+        future_df.loc[future_df['mois'].isin([12, 1, 2]), 'hiver'] = 1
+        future_df.loc[future_df['mois'].isin([3, 4, 5]), 'printemps'] = 1
+        future_df.loc[future_df['mois'].isin([6, 7, 8]), 'ete'] = 1
+        future_df.loc[future_df['mois'].isin([9, 10, 11]), 'automne'] = 1
+        
+        # Step 1: Predict nb_entrees_HO for future dates
+        X_future_ho, _, num_features_ho, cat_features_ho = self.prepare_features(
+            future_df, 'nb_entrees_HO'
+        )
+        ho_predictions = self.best_models['step1'].predict(X_future_ho)
+        
+        # Step 2: Predict nb_entrees_cantine using HO predictions
+        future_df['nb_entrees_HO'] = ho_predictions
+        X_future_cantine, _, num_features_cantine, cat_features_cantine = self.prepare_features(
+            future_df, 'nb_entrees_cantine', include_entrees_ho=True
+        )
+        cantine_predictions = self.best_models['step2'].predict(X_future_cantine)
+        
+        # Create results dataframe
+        results = pd.DataFrame({
+            'date': future_dates,
+            'predicted_nb_entrees_HO': ho_predictions,
+            'predicted_nb_entrees_cantine': cantine_predictions
+        })
+        
+        # Plot future predictions
+        plt.figure(figsize=(15, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(results['date'], results['predicted_nb_entrees_HO'])
+        plt.title('Predicted Company Entries (Future)')
+        plt.xticks(rotation=45)
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(results['date'], results['predicted_nb_entrees_cantine'])
+        plt.title('Predicted Cantine Entries (Future)')
+        plt.xticks(rotation=45)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return results
+
+# Main execution function
+def main():
+    # Load your data
+    # df = pd.read_csv('your_data.csv')  # Replace with your actual data loading
+    
+    # For demonstration, creating a sample dataset structure
+    # You should replace this with your actual data loading
+    print("Loading data...")
+    dates = pd.date_range(start='2022-05-05', end='2024-09-26', freq='D')
+    sample_data = {
+        'date': dates,
+        'jour': dates.day,
+        'mois': dates.month,
+        'annee': dates.year,
+        'jour_alpha': dates.day_name(),
+        'conge_scolaires': np.random.randint(0, 2, len(dates)),
+        'jeune_tres_probable': np.random.randint(0, 2, len(dates)),
+        'jeune_probable': np.random.randint(0, 2, len(dates)),
+        'temperature': np.random.normal(20, 5, len(dates)),
+        'vitesse du vent': np.random.normal(15, 5, len(dates)),
+        'clair': np.random.randint(0, 2, len(dates)),
+        'nuageux': np.random.randint(0, 2, len(dates)),
+        'fortement nuageux': np.random.randint(0, 2, len(dates)),
+        'pluie': np.random.randint(0, 2, len(dates)),
+        'BEM': np.random.randint(0, 2, len(dates)),
+        'BAC': np.random.randint(0, 2, len(dates)),
+        'hiver': (dates.month.isin([12, 1, 2])).astype(int),
+        'printemps': (dates.month.isin([3, 4, 5])).astype(int),
+        'ete': (dates.month.isin([6, 7, 8])).astype(int),
+        'automne': (dates.month.isin([9, 10, 11])).astype(int),
+        'nb_entrees_HO': np.random.normal(300, 50, len(dates)),
+        'nb_entrees_cantine': np.random.normal(250, 40, len(dates))
+    }
+    df = pd.DataFrame(sample_data)
+    
+    # Map jour_alpha to numerical values and drop original column :cite[1]
+    day_mapping = {
+        'Monday': 0, 'Tuesday': 1, 'Wednesday': 2, 'Thursday': 3,
+        'Friday': 4, 'Saturday': 5, 'Sunday': 6
+    }
+    df['day_week'] = df['jour_alpha'].map(day_mapping)
+    df = df.drop('jour_alpha', axis=1)
+    
+    # Initialize predictor
+    predictor = CanteenDemandPredictor()
+    
+    # Step 1: Train model for nb_entrees_HO
+    best_model_step1, results_step1 = predictor.train_models_step1(df)
+    
+    # Generate HO predictions for step 2 training
+    X_ho, y_ho, num_ho, cat_ho = predictor.prepare_features(df, 'nb_entrees_HO')
+    ho_predictions_train = best_model_step1.predict(X_ho)
+    
+    # Step 2: Train model for nb_entrees_cantine
+    best_model_step2, results_step2 = predictor.train_models_step2(df, ho_predictions_train)
+    
+    # Generate future predictions
+    future_predictions = predictor.predict_future(df)
+    
+    # Save results to CSV
+    future_predictions.to_csv('canteen_predictions_2024.csv', index=False)
+    print("\nPredictions saved to 'canteen_predictions_2024.csv'")
+    
+    # Print summary statistics
+    print("\n" + "=" * 50)
+    print("PREDICTION SUMMARY")
+    print("=" * 50)
+    print(f"Average predicted company entries: {future_predictions['predicted_nb_entrees_HO'].mean():.0f}")
+    print(f"Average predicted cantine entries: {future_predictions['predicted_nb_entrees_cantine'].mean():.0f}")
+    print(f"Recommended meals to order: {future_predictions['predicted_nb_entrees_cantine'].mean():.0f}")
+    
+    return predictor, future_predictions
+
+# Execute the main function
+if __name__ == "__main__":
+    predictor, predictions = main()
