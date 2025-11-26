@@ -1,0 +1,77 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Supposons que votre DataFrame s'appelle df
+# Assurez-vous que la colonne 'date' est au format datetime
+df['date'] = pd.to_datetime(df['date'])
+
+# Créer une figure avec des sous-graphiques pour chaque mois
+fig, axes = plt.subplots(3, 4, figsize=(20, 15))
+axes = axes.flatten()
+
+# Couleurs pour les séries
+couleur_ho = 'tab:blue'
+couleur_cantine = 'tab:orange'
+
+for mois in range(1, 13):
+    ax = axes[mois-1]
+    
+    # Filtrer les données pour le mois spécifique
+    data_mois = df[df['mois'] == mois].copy()
+    data_mois = data_mois.sort_values('date')
+    
+    if not data_mois.empty:
+        # Tracer les deux séries temporelles
+        ax.plot(data_mois['date'], data_mois['nombre entrees HO'], 
+                color=couleur_ho, label='Entrées HO', linewidth=2)
+        ax.plot(data_mois['date'], data_mois['nombre entrees cantine'], 
+                color=couleur_cantine, label='Entrées cantine', linewidth=2)
+        
+        # Ligne de référence à 400
+        ax.axhline(y=400, color='red', linestyle='--', alpha=0.7, label='Seuil 400')
+        
+        # Configuration du graphique
+        ax.set_title(f'Mois {mois:02d}', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Nombre d\'entrées')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # Format des dates sur l'axe x
+        ax.tick_params(axis='x', rotation=45)
+    else:
+        ax.text(0.5, 0.5, f'Aucune donnée\npour le mois {mois}', 
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(f'Mois {mois:02d}')
+
+# Ajuster l'espacement entre les graphiques
+plt.tight_layout()
+plt.show()
+
+# Version avec graphiques séparés
+for mois in range(1, 13):
+    plt.figure(figsize=(10, 6))
+    
+    # Filtrer les données pour le mois spécifique
+    data_mois = df[df['mois'] == mois].copy()
+    data_mois = data_mois.sort_values('date')
+    
+    if not data_mois.empty:
+        plt.plot(data_mois['date'], data_mois['nombre entrees HO'], 
+                 color=couleur_ho, label='Entrées HO', linewidth=2)
+        plt.plot(data_mois['date'], data_mois['nombre entrees cantine'], 
+                 color=couleur_cantine, label='Entrées cantine', linewidth=2)
+        
+        plt.axhline(y=400, color='red', linestyle='--', alpha=0.7, label='Seuil 400')
+        
+        plt.title(f'Series temporelles - Mois {mois:02d}', fontsize=14, fontweight='bold')
+        plt.xlabel('Date')
+        plt.ylabel('Nombre d\'entrées')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print(f"Aucune donnée disponible pour le mois {mois}")
